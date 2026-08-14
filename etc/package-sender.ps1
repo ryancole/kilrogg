@@ -20,14 +20,19 @@ $root = Split-Path $PSScriptRoot -Parent
 $buildDir = Join-Path $root 'build-dist'
 if (-not $OutDir) { $OutDir = Join-Path $root 'dist' }
 
-$certSubject = 'CN=kilrogg (Ryan Cole, self-signed)'
+# Looked up by FriendlyName, not Subject: DN values containing commas get
+# re-rendered with escaping quotes by the store, which makes Subject string
+# comparison silently fail and mint a duplicate cert on every run.
+$certFriendlyName = 'kilrogg code signing'
+$certSubject = 'CN=kilrogg self-signed (Ryan Cole)'
 $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert |
-    Where-Object { $_.Subject -eq $certSubject -and $_.NotAfter -gt (Get-Date) } |
+    Where-Object { $_.FriendlyName -eq $certFriendlyName -and $_.NotAfter -gt (Get-Date) } |
     Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $cert) {
     Write-Host "No signing certificate found, creating one ($certSubject)..."
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $certSubject `
-        -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(5)
+        -FriendlyName $certFriendlyName -CertStoreLocation Cert:\CurrentUser\My `
+        -NotAfter (Get-Date).AddYears(5)
 }
 Write-Host "Signing with $($cert.Subject), thumbprint $($cert.Thumbprint)"
 
@@ -64,6 +69,27 @@ try {
 
     Export-Certificate -Cert $cert -FilePath (Join-Path $stage 'kilrogg-signing.cer') | Out-Null
 
+    @'
+@echo off
+rem Installs the kilrogg signing certificate into this machine's trusted
+rem stores so Windows trusts kilrogg-send.exe's signature. Only run this on
+rem machines you own.
+
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Requesting administrator access...
+    powershell -Command "Start-Process -Verb RunAs -FilePath '%~f0'"
+    exit /b
+)
+
+cd /d "%~dp0"
+certutil -addstore Root kilrogg-signing.cer
+certutil -addstore TrustedPublisher kilrogg-signing.cer
+echo.
+echo Done. kilrogg's signature is now trusted on this machine.
+pause
+'@ | Set-Content (Join-Path $stage 'install-cert.cmd')
+
     @"
 kilrogg sender
 ==============
@@ -84,8 +110,8 @@ Signature
 ---------
 kilrogg-send.exe is signed with the self-signed certificate included as
 kilrogg-signing.cer. To make Windows trust the signature (reduces
-SmartScreen/antivirus friction), open an ADMIN command prompt in this
-folder and run:
+SmartScreen/antivirus friction), double-click install-cert.cmd and accept
+the administrator prompt. It runs:
 
     certutil -addstore Root kilrogg-signing.cer
     certutil -addstore TrustedPublisher kilrogg-signing.cer
