@@ -159,8 +159,12 @@ bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
         Sleep(2); // static screen — normal, not an error
         return false;
     }
-    if (hr == DXGI_ERROR_ACCESS_LOST) {
-        // Mode switch, secure desktop, etc. Recreate and resend a keyframe.
+    if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL) {
+        // ACCESS_LOST: mode switch, secure desktop, etc. INVALID_CALL: the
+        // duplication is poisoned — seen when a game engages exclusive
+        // fullscreen, especially on hybrid-GPU machines. Recreate it; the
+        // next successful frame is a full-frame keyframe either way.
+        Sleep(100);
         reinit_duplication();
         return false;
     }
