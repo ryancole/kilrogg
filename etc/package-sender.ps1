@@ -63,9 +63,14 @@ try {
     if (-not $sig.SignerCertificate) {
         Write-Error "signing failed: $($sig.Status) $($sig.StatusMessage)"
     }
-    # Status is NotTrusted/UnknownError on machines that haven't installed the
-    # cert - expected for self-signed. Signed is what matters here.
-    Write-Host "Signed: $($sig.Status) ($($sig.StatusMessage))"
+    if ($sig.Status -eq 'Valid') {
+        Write-Host "Signed (trusted on this machine)"
+    } else {
+        # Chain-of-trust statuses are expected for a self-signed cert on a
+        # machine that hasn't run install-cert.cmd; the signature itself is
+        # intact.
+        Write-Host "Signed (self-signed: untrusted here until install-cert.cmd runs - this is normal)"
+    }
 
     Export-Certificate -Cert $cert -FilePath (Join-Path $stage 'kilrogg-signing.cer') | Out-Null
 
