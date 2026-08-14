@@ -97,10 +97,15 @@ int run(int argc, char** argv) {
 
     // Latest-wins handoff: if the send thread is behind, the newer frame
     // absorbs the dropped frame's dirty rects (its pixels are already the
-    // full image, so nothing on screen is lost).
+    // full image, so nothing on screen is lost). Accumulated rects overlap —
+    // a fullscreen game dirties the whole screen every frame — so once they
+    // cover more pixels than the frame itself, one keyframe is strictly
+    // cheaper than resending the overlap.
     Mailbox<Frame> mailbox([w, h](Frame& incoming, Frame& pending) {
         incoming.rects.insert(incoming.rects.end(), pending.rects.begin(), pending.rects.end());
-        if (incoming.rects.size() > 256) incoming.rects.assign(1, Rect{0, 0, w, h});
+        uint64_t area = 0;
+        for (const Rect& r : incoming.rects) area += uint64_t{r.w} * r.h;
+        if (area > uint64_t{w} * h) incoming.rects.assign(1, Rect{0, 0, w, h});
     });
 
     std::thread capture([&] {
