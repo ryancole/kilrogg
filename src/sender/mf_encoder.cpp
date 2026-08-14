@@ -74,13 +74,24 @@ bool MfH264Encoder::init(ComPtr<ID3D11Device> device, uint32_t width, uint32_t h
         KRG_LOG("no hardware H.264 encoder found on this machine");
         return false;
     }
-    WCHAR name[256] = L"?";
-    activates[0]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
-    KRG_LOG("encoder: %ls", name);
-    HRESULT hr = activates[0]->ActivateObject(IID_PPV_ARGS(&transform_));
+    // Activation can fail even for an enumerated MFT (stale GPU driver is the
+    // usual cause), and multi-GPU machines list several — try each in order.
+    for (UINT32 i = 0; i < count && !transform_; ++i) {
+        WCHAR name[256] = L"?";
+        activates[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
+        HRESULT hr = activates[i]->ActivateObject(IID_PPV_ARGS(&transform_));
+        if (SUCCEEDED(hr)) {
+            KRG_LOG("encoder: %ls", name);
+        } else {
+            KRG_LOG("encoder '%ls' failed to activate (hr=0x%08lX), trying next", name, hr);
+        }
+    }
     for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
     CoTaskMemFree(activates);
-    KRG_HR(hr);
+    if (!transform_) {
+        KRG_LOG("no hardware H.264 encoder could be activated — a GPU driver update usually fixes this");
+        return false;
+    }
 
     ComPtr<IMFAttributes> attrs;
     KRG_HR(transform_->GetAttributes(&attrs));
@@ -229,9 +240,10 @@ bool MfH264Encoder::convert_to_nv12(ID3D11Texture2D* bgra, ComPtr<IMFSample>& ou
         return false;
     }
 
-    const int64_t duration = 10'000'000 / fps_;
-    sample->SetSampleTime(frame_index_ * duration);
-    sample->SetSampleDuration(duration);
+    // Real clock timestamps so on_have_output can measure capture-to-wire
+    // latency; encoders only need monotonic times.
+    sample->SetSampleTime(MFGetSystemTime());
+    sample->SetSampleDuration(10'000'000 / fps_);
     ++frame_index_;
     out = std::move(sample);
     return true;
@@ -239,7 +251,10 @@ bool MfH264Encoder::convert_to_nv12(ID3D11Texture2D* bgra, ComPtr<IMFSample>& ou
 
 bool MfH264Encoder::encode(ID3D11Texture2D* bgra) {
     ComPtr<IMFSample> sample;
-    if (!convert_to_nv12(bgra, sample)) return true; // dropped, not fatal
+    if (!convert_to_nv12(bgra, sample)) {
+        ++dropped_; // encoder backlogged (sample pool exhausted); not fatal
+        return true;
+    }
 
     std::lock_guard lock(mutex_);
     if (input_credits_ > 0) {
@@ -331,6 +346,26 @@ void MfH264Encoder::on_have_output() {
         if (sink_) sink_(data, len, keyframe);
     }
     buffer->Unlock();
+
+    // Capture-to-wire latency on the sender's own clock; if the stream feels
+    // delayed but this stays low, the delay lives in the network or receiver.
+    LONGLONG ts = 0;
+    if (SUCCEEDED(sample->GetSampleTime(&ts))) {
+        double ms = (MFGetSystemTime() - ts) / 10'000.0;
+        latency_sum_ms_ += ms;
+        if (ms > latency_max_ms_) latency_max_ms_ = ms;
+        ++latency_count_;
+        if (last_log_time_ == 0) last_log_time_ = MFGetSystemTime();
+        if (MFGetSystemTime() - last_log_time_ >= 5 * 10'000'000LL) {
+            last_log_time_ = MFGetSystemTime();
+            KRG_LOG("encode latency avg %.0f ms, max %.0f ms; %u frames dropped pre-encode",
+                    latency_sum_ms_ / latency_count_, latency_max_ms_, dropped_.load());
+            latency_sum_ms_ = 0;
+            latency_max_ms_ = 0;
+            latency_count_ = 0;
+            dropped_ = 0;
+        }
+    }
 }
 
 } // namespace krg

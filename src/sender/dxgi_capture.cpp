@@ -151,9 +151,13 @@ bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
 
     DXGI_OUTDUPL_FRAME_INFO info{};
     ComPtr<IDXGIResource> resource;
-    HRESULT hr = dup_->AcquireNextFrame(100, &info, &resource);
+    // Zero timeout + short sleep instead of a blocking wait: blocking inside
+    // AcquireNextFrame holds up other users of this device (the encoder's
+    // GPU submissions), adding hundreds of ms of latency.
+    HRESULT hr = dup_->AcquireNextFrame(0, &info, &resource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        return false; // static screen — normal, not an error
+        Sleep(2); // static screen — normal, not an error
+        return false;
     }
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         // Mode switch, secure desktop, etc. Recreate and resend a keyframe.

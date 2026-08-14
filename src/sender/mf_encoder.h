@@ -67,6 +67,10 @@ private:
 
     std::thread event_thread_;
     std::atomic<bool> stop_{false};
+    std::atomic<uint32_t> dropped_{0};
+    double latency_sum_ms_ = 0, latency_max_ms_ = 0; // event thread only
+    uint32_t latency_count_ = 0;
+    int64_t last_log_time_ = 0;
 };
 
 } // namespace krg

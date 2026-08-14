@@ -1,5 +1,7 @@
 #include <windows.h>
 
+#include <timeapi.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -258,10 +260,23 @@ int run_h264(const Options& opt, SOCKET listener) {
         });
         encoder->request_keyframe();
 
+        // Async encoders hold a pipeline of frames and only emit frame N when
+        // frame N+1 arrives, so sparse content (a desktop with occasional
+        // changes) would sit in the encoder for seconds. On a quiet tick,
+        // re-submit the last frame to flush changes through — but only for a
+        // bounded burst, so a truly static screen stops producing traffic.
+        ComPtr<ID3D11Texture2D> last_tex;
+        int flush_budget = 0;
         while (!dead) {
-            auto tex = mailbox.pop();
-            if (!tex) break;
-            if (!encoder->encode(tex->Get())) break;
+            auto tex = mailbox.pop_for(std::chrono::milliseconds(16));
+            if (tex) {
+                last_tex = std::move(*tex);
+                flush_budget = 30;
+            } else {
+                if (flush_budget <= 0 || !last_tex) continue;
+                --flush_budget;
+            }
+            if (!encoder->encode(last_tex.Get())) break;
         }
         encoder->set_sink(nullptr);
         closesocket(client);
@@ -292,6 +307,8 @@ int run(int argc, char** argv) {
     }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    timeBeginPeriod(1); // 1ms timer resolution: capture polling and frame
+                        // pacing rely on short sleeps being actually short
     if (!net::init()) {
         KRG_LOG("WSAStartup failed");
         return 1;
