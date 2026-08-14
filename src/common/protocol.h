@@ -3,7 +3,8 @@
 
 namespace krg {
 
-constexpr uint32_t kMagic = 0x3147524B; // "KRG1" little-endian
+constexpr uint32_t kMagic = 0x3147524B;      // "KRG1": LZ4 dirty-rect stream
+constexpr uint32_t kMagicVideo = 0x3247524B; // "KRG2": H.264 video stream
 constexpr uint16_t kDefaultPort = 47800;
 
 // Wire format (little-endian, Windows-only):
@@ -27,6 +28,15 @@ struct RectHeader {
     uint32_t comp_size; // LZ4-compressed payload bytes following this header
     uint32_t raw_size;  // w * h * 4
 };
+
+// KRG2: after Hello, the stream is a sequence of these followed by `size`
+// bytes of H.264 Annex B data (SPS/PPS arrive in-band before each IDR).
+struct VideoPacketHeader {
+    uint32_t size;
+    uint32_t flags; // kPacketKeyframe
+};
 #pragma pack(pop)
+
+constexpr uint32_t kPacketKeyframe = 1;
 
 } // namespace krg

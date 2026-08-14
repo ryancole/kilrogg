@@ -23,13 +23,21 @@ struct RectUpdate {
 // All methods must be called from the thread that created the Presenter.
 class Presenter {
 public:
-    static std::unique_ptr<Presenter> create(uint32_t frame_width, uint32_t frame_height);
+    // video_mode: the remote framebuffer is NV12 (H.264 stream) rather than
+    // BGRA dirty rects; copy_video_frame()/present() replace apply()/present().
+    static std::unique_ptr<Presenter> create(uint32_t frame_width, uint32_t frame_height,
+                                             bool video_mode = false);
 
     // Drains the message queue; returns false once the window is closed.
     bool pump();
 
     void apply(const std::vector<RectUpdate>& updates);
+    // Copies a decoded NV12 frame (array slice `subresource`) into the
+    // presenter's own texture; callable from the decode thread.
+    void copy_video_frame(ID3D11Texture2D* nv12, UINT subresource);
     void present();
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device() const { return device_; }
 
 private:
     Presenter() = default;
@@ -41,6 +49,7 @@ private:
     HWND hwnd_ = nullptr;
     uint32_t frame_w_ = 0, frame_h_ = 0;
     bool tearing_ = false;
+    bool video_mode_ = false;
     bool present_error_logged_ = false;
     Microsoft::WRL::ComPtr<ID3D11InfoQueue> info_queue_;
 
@@ -52,7 +61,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> frame_srv_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> ps_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> ps_nv12_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12_tex_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> nv12_y_srv_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> nv12_uv_srv_;
 };
 
 } // namespace krg

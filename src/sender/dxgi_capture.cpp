@@ -34,6 +34,12 @@ bool DxgiCapture::init() {
         return false;
     }
 
+    // The video path uses this device from the capture, send, and MF worker
+    // threads concurrently.
+    ComPtr<ID3D10Multithread> mt;
+    context_.As(&mt);
+    if (mt) mt->SetMultithreadProtected(TRUE);
+
     ComPtr<IDXGIDevice> dxgi_device;
     device_.As(&dxgi_device);
     ComPtr<IDXGIAdapter> adapter;
@@ -135,7 +141,9 @@ void DxgiCapture::collect_rects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector
     for (UINT i = 0; i < dirty_bytes / sizeof(RECT); ++i) rects.push_back(rect_from(dirty[i]));
 }
 
-bool DxgiCapture::next_frame(Frame& out) {
+bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
+                          std::vector<Rect>& rects) {
+    have_rects = false;
     if (!dup_ && !reinit_duplication()) {
         Sleep(500); // avoid a hot spin while the desktop is unavailable
         return false;
@@ -158,7 +166,7 @@ bool DxgiCapture::next_frame(Frame& out) {
         return false;
     }
 
-    std::vector<Rect> rects;
+    rects.clear();
     collect_rects(info, rects);
 
     // Only the mouse pointer changed: nothing to send (no cursor overlay yet).
@@ -167,13 +175,56 @@ bool DxgiCapture::next_frame(Frame& out) {
         return false;
     }
 
-    ComPtr<ID3D11Texture2D> tex;
-    resource.As(&tex);
-    context_->CopyResource(staging_.Get(), tex.Get());
+    resource.As(&acquired);
+    have_rects = true;
+    return true;
+}
+
+bool DxgiCapture::next_frame_texture(ComPtr<ID3D11Texture2D>& out) {
+    ComPtr<ID3D11Texture2D> acquired;
+    bool have_rects = false;
+    std::vector<Rect> rects;
+    if (!acquire(acquired, have_rects, rects)) return false;
+
+    if (!pool_[0]) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = width_;
+        td.Height = height_;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        for (auto& tex : pool_) {
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, &tex))) {
+                KRG_LOG("capture pool texture creation failed");
+                dup_->ReleaseFrame();
+                return false;
+            }
+        }
+    }
+
+    ComPtr<ID3D11Texture2D>& slot = pool_[pool_index_ % std::size(pool_)];
+    ++pool_index_;
+    context_->CopyResource(slot.Get(), acquired.Get());
+    dup_->ReleaseFrame();
+    out = slot;
+    first_frame_ = false;
+    return true;
+}
+
+bool DxgiCapture::next_frame(Frame& out) {
+    ComPtr<ID3D11Texture2D> acquired;
+    bool have_rects = false;
+    std::vector<Rect> rects;
+    if (!acquire(acquired, have_rects, rects)) return false;
+
+    context_->CopyResource(staging_.Get(), acquired.Get());
     dup_->ReleaseFrame();
 
     D3D11_MAPPED_SUBRESOURCE map{};
-    hr = context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &map);
+    HRESULT hr = context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &map);
     if (FAILED(hr)) {
         KRG_LOG("staging map failed (hr=0x%08lX)", hr);
         return false;

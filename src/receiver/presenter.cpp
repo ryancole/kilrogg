@@ -8,6 +8,15 @@
 
 using Microsoft::WRL::ComPtr;
 
+#define KRG_HRB(expr)                                         \
+    do {                                                      \
+        HRESULT hrb_ = (expr);                                \
+        if (FAILED(hrb_)) {                                   \
+            KRG_LOG("%s failed (hr=0x%08lX)", #expr, hrb_);   \
+            return false;                                     \
+        }                                                     \
+    } while (0)
+
 namespace krg {
 
 namespace {
@@ -24,6 +33,19 @@ VSOut vs_main(uint id : SV_VertexID) {
 Texture2D tex : register(t0);
 SamplerState smp : register(s0);
 float4 ps_main(VSOut i) : SV_Target { return tex.Sample(smp, i.uv); }
+
+// NV12 (BT.709, limited range) to RGB.
+Texture2D texY  : register(t0);
+Texture2D texUV : register(t1);
+float4 ps_nv12(VSOut i) : SV_Target {
+    float y = (texY.Sample(smp, i.uv).r - 16.0 / 255.0) * (255.0 / 219.0);
+    float2 uv = (texUV.Sample(smp, i.uv).rg - 0.5) * (255.0 / 224.0);
+    float3 rgb = float3(
+        y + 1.5748 * uv.y,
+        y - 0.1873 * uv.x - 0.4681 * uv.y,
+        y + 1.8556 * uv.x);
+    return float4(saturate(rgb), 1);
+}
 )";
 
 constexpr char kWndClass[] = "KilroggWindow";
@@ -51,8 +73,10 @@ LRESULT CALLBACK Presenter::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-std::unique_ptr<Presenter> Presenter::create(uint32_t frame_width, uint32_t frame_height) {
+std::unique_ptr<Presenter> Presenter::create(uint32_t frame_width, uint32_t frame_height,
+                                             bool video_mode) {
     std::unique_ptr<Presenter> p(new Presenter());
+    p->video_mode_ = video_mode;
     if (!p->init(frame_width, frame_height)) return nullptr;
     return p;
 }
@@ -89,7 +113,9 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
 
     // Set KILROGG_D3D_DEBUG=1 to run with the D3D11 debug layer; validation
     // messages are echoed to stderr after each present.
-    UINT flags = 0;
+    // VIDEO_SUPPORT + BGRA: required for sharing the device with the MF/DXVA
+    // decoder in video mode; harmless otherwise.
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     if (GetEnvironmentVariableA("KILROGG_D3D_DEBUG", nullptr, 0) > 0) {
         flags |= D3D11_CREATE_DEVICE_DEBUG;
     }
@@ -97,7 +123,7 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
                                    D3D11_SDK_VERSION, &device_, nullptr, &ctx_);
     if (FAILED(hr) && (flags & D3D11_CREATE_DEVICE_DEBUG)) {
         KRG_LOG("debug layer unavailable, falling back to normal device");
-        flags = 0;
+        flags &= ~D3D11_CREATE_DEVICE_DEBUG;
         hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
                                D3D11_SDK_VERSION, &device_, nullptr, &ctx_);
     }
@@ -109,6 +135,11 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
         device_.As(&info_queue_);
         KRG_LOG("D3D11 debug layer enabled");
     }
+    // The MF decoder's worker threads share this device in video mode, and
+    // copy_video_frame() runs on the decode thread.
+    ComPtr<ID3D10Multithread> mt;
+    ctx_.As(&mt);
+    if (mt) mt->SetMultithreadProtected(TRUE);
 
     ComPtr<IDXGIDevice> dxgi_device;
     device_.As(&dxgi_device);
@@ -154,16 +185,33 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
     td.Height = frame_h_;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    hr = device_->CreateTexture2D(&td, nullptr, &frame_tex_);
-    if (FAILED(hr)) {
-        KRG_LOG("frame texture creation failed (hr=0x%08lX)", hr);
-        return false;
+    if (video_mode_) {
+        td.Format = DXGI_FORMAT_NV12;
+        hr = device_->CreateTexture2D(&td, nullptr, &nv12_tex_);
+        if (FAILED(hr)) {
+            KRG_LOG("NV12 texture creation failed (hr=0x%08lX)", hr);
+            return false;
+        }
+        // NV12 is sampled as two planes: R8 luma and R8G8 chroma.
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        sv.Format = DXGI_FORMAT_R8_UNORM;
+        KRG_HRB(device_->CreateShaderResourceView(nv12_tex_.Get(), &sv, &nv12_y_srv_));
+        sv.Format = DXGI_FORMAT_R8G8_UNORM;
+        KRG_HRB(device_->CreateShaderResourceView(nv12_tex_.Get(), &sv, &nv12_uv_srv_));
+    } else {
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        hr = device_->CreateTexture2D(&td, nullptr, &frame_tex_);
+        if (FAILED(hr)) {
+            KRG_LOG("frame texture creation failed (hr=0x%08lX)", hr);
+            return false;
+        }
+        device_->CreateShaderResourceView(frame_tex_.Get(), nullptr, &frame_srv_);
     }
-    device_->CreateShaderResourceView(frame_tex_.Get(), nullptr, &frame_srv_);
 
     ComPtr<ID3DBlob> blob, errors;
     hr = D3DCompile(kShaderSrc, sizeof(kShaderSrc) - 1, nullptr, nullptr, nullptr, "vs_main",
@@ -185,6 +233,18 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
         return false;
     }
     device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &ps_);
+
+    blob.Reset();
+    errors.Reset();
+    hr = D3DCompile(kShaderSrc, sizeof(kShaderSrc) - 1, nullptr, nullptr, nullptr, "ps_nv12",
+                    "ps_5_0", 0, 0, &blob, &errors);
+    if (FAILED(hr)) {
+        KRG_LOG("NV12 pixel shader compile failed: %s",
+                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+        return false;
+    }
+    device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                               &ps_nv12_);
 
     D3D11_SAMPLER_DESC samp{};
     samp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -231,6 +291,14 @@ void Presenter::apply(const std::vector<RectUpdate>& updates) {
     }
 }
 
+void Presenter::copy_video_frame(ID3D11Texture2D* nv12, UINT subresource) {
+    if (!nv12_tex_) return;
+    // Decoder textures may be padded to macroblock alignment; copy only our
+    // frame's region. The box also crops the chroma plane correspondingly.
+    D3D11_BOX box{0, 0, 0, frame_w_, frame_h_, 1};
+    ctx_->CopySubresourceRegion(nv12_tex_.Get(), 0, 0, 0, 0, nv12, subresource, &box);
+}
+
 void Presenter::present() {
     if (!rtv_) return;
     RECT rc{};
@@ -245,9 +313,15 @@ void Presenter::present() {
     ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx_->IASetInputLayout(nullptr);
     ctx_->VSSetShader(vs_.Get(), nullptr, 0);
-    ctx_->PSSetShader(ps_.Get(), nullptr, 0);
-    ID3D11ShaderResourceView* srvs[] = {frame_srv_.Get()};
-    ctx_->PSSetShaderResources(0, 1, srvs);
+    if (video_mode_) {
+        ctx_->PSSetShader(ps_nv12_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvs[] = {nv12_y_srv_.Get(), nv12_uv_srv_.Get()};
+        ctx_->PSSetShaderResources(0, 2, srvs);
+    } else {
+        ctx_->PSSetShader(ps_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvs[] = {frame_srv_.Get()};
+        ctx_->PSSetShaderResources(0, 1, srvs);
+    }
     ID3D11SamplerState* samplers[] = {sampler_.Get()};
     ctx_->PSSetSamplers(0, 1, samplers);
     ID3D11RenderTargetView* rtvs[] = {rtv_.Get()};

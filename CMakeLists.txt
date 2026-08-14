@@ -42,15 +42,19 @@ add_executable(kilrogg-send
   src/sender/main.cpp
   src/sender/dummy_source.cpp
   src/sender/dxgi_capture.cpp
+  src/sender/mf_encoder.cpp
   src/sender/kilrogg-send.rc
 )
 target_include_directories(kilrogg-send PRIVATE ${lz4_SOURCE_DIR}/lib)
-target_link_libraries(kilrogg-send PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi user32)
+target_link_libraries(kilrogg-send PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi user32
+  mf mfplat mfuuid evr ole32 oleaut32)
 
 add_executable(kilrogg-recv
   src/receiver/main.cpp
   src/receiver/presenter.cpp
+  src/receiver/mf_decoder.cpp
   src/receiver/kilrogg-recv.rc
 )
 target_include_directories(kilrogg-recv PRIVATE ${lz4_SOURCE_DIR}/lib)
-target_link_libraries(kilrogg-recv PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi d3dcompiler user32)
+target_link_libraries(kilrogg-recv PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi d3dcompiler user32
+  mf mfplat mfuuid evr ole32 oleaut32)

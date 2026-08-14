@@ -1,30 +1,39 @@
 # kilrogg
 
-Low-latency one-way Windows desktop streaming over LAN. No audio, no input —
-just pixels, as fast as possible.
+Low-latency one-way Windows screen streaming over LAN, built for game
+streaming (the whole screen changing every frame). No audio, no input — just
+pixels, as fast as possible.
 
 ## Pipeline
 
 ```
-sender:    Desktop Duplication ──► [mailbox] ──► dirty rects + LZ4 ──► TCP (TCP_NODELAY)
-receiver:  TCP ──► LZ4 decode ──► [mailbox] ──► D3D11 flip-model present (vsync off)
+sender:    Desktop Duplication ──► [mailbox] ──► hardware H.264 (NVENC etc.) ──► TCP (TCP_NODELAY)
+receiver:  TCP ──► hardware H.264 decode ──► [mailbox] ──► D3D11 flip-model present (vsync off)
 ```
 
 Each side is two threads joined by a single-slot, latest-wins **mailbox**
-([mailbox.h](src/common/mailbox.h)). If the consumer falls behind, the newer
-frame replaces the pending one — but its dirty rects are merged in first, so a
-dropped frame never loses screen updates (the frame always carries the full
-desktop image; only the "what changed" list needs to survive).
+([mailbox.h](src/common/mailbox.h)): if a consumer falls behind, stale frames
+are dropped *before* encoding, never after.
 
-- **Capture**: DXGI Desktop Duplication of the primary output, with dirty and
-  move rects. `AcquireNextFrame` timing out on a static screen is normal and
-  simply produces no traffic.
-- **Wire**: per frame, only the dirty rects are sent, each LZ4-compressed.
-  A full-frame rect doubles as the keyframe on (re)connect. See
-  [protocol.h](src/common/protocol.h).
-- **Present**: persistent GPU texture patched per-rect, drawn through a
-  flip-model swapchain with sync interval 0 and `DXGI_PRESENT_ALLOW_TEARING`,
-  so presentation never blocks on vblank.
+- **Capture**: DXGI Desktop Duplication of the primary output. Frames stay on
+  the GPU from capture through encode — no CPU copies on the sender.
+  `AcquireNextFrame` timing out on a static screen is normal and simply
+  produces no traffic.
+- **Encode**: the GPU vendor's H.264 encoder via Media Foundation
+  ([mf_encoder.cpp](src/sender/mf_encoder.cpp)) — CBR, low-latency mode,
+  ~40 Mbit/s default. BGRA→NV12 conversion runs on the GPU video processor.
+- **Wire**: `Hello` then length-prefixed H.264 Annex B packets; an IDR is
+  forced on every (re)connect. See [protocol.h](src/common/protocol.h).
+- **Decode/Present**: hardware decode (DXVA) on the presenter's own D3D11
+  device ([mf_decoder.cpp](src/receiver/mf_decoder.cpp)); NV12 is converted to
+  RGB in the pixel shader and drawn through a flip-model swapchain with sync
+  interval 0 and `DXGI_PRESENT_ALLOW_TEARING`, so presentation never blocks
+  on vblank.
+
+`--codec lz4` selects the original lossless dirty-rect + LZ4 path (pixel-
+perfect, near-zero traffic on a static desktop, but tops out around 10 fps
+when the whole screen changes). Kept as a debug reference; the receiver
+auto-detects the mode from the handshake.
 
 ## Build
 
@@ -51,9 +60,10 @@ build\Release\kilrogg-recv.exe <host-ip>
 ```
 
 Esc or closing the window quits the receiver; the sender keeps listening for
-the next connection. `kilrogg-send --dummy` streams a synthetic bouncing
-square instead of the desktop — useful for testing the pipeline without
-capture, including over loopback.
+the next connection. Sender flags: `--bitrate N` (Mbit/s, default 40),
+`--codec h264|lz4`, `--port N`, and `--dummy`, which streams a synthetic
+bouncing square instead of the desktop — useful for testing the pipeline
+without capture, including over loopback.
 
 ## Current limitations / roadmap
 
@@ -62,6 +72,5 @@ capture, including over loopback.
   pointer-only updates are currently skipped).
 - Display resolution changes mid-stream exit the sender rather than
   renegotiating.
-- Sender copies the full desktop to CPU each frame; copying only dirty regions
-  (`CopySubresourceRegion` per rect) would cut GPU→CPU bandwidth a lot.
+- Requires a hardware H.264 encoder (any non-ancient GPU) and decoder.
 - Unencrypted, unauthenticated TCP — LAN/trusted networks only.
