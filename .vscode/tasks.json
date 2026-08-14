@@ -25,6 +25,12 @@
             "problemMatcher": []
         },
         {
+            "label": "clean",
+            "type": "shell",
+            "command": "powershell -ExecutionPolicy Bypass -File etc/clean.ps1",
+            "problemMatcher": []
+        },
+        {
             "label": "local test (dummy source)",
             "type": "shell",
             "command": "powershell -ExecutionPolicy Bypass -File etc/local-test.ps1",
