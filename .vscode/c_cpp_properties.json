@@ -1,0 +1,20 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "Win32",
+            "configurationProvider": "ms-vscode.cmake-tools",
+            "includePath": [
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/build/_deps/lz4-src/lib"
+            ],
+            "defines": [
+                "WIN32_LEAN_AND_MEAN",
+                "NOMINMAX"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ]
+}
