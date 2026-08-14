@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(kilrogg LANGUAGES CXX)
+project(kilrogg LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,7 @@ add_executable(kilrogg-send
   src/sender/main.cpp
   src/sender/dummy_source.cpp
   src/sender/dxgi_capture.cpp
+  src/sender/kilrogg-send.rc
 )
 target_include_directories(kilrogg-send PRIVATE ${lz4_SOURCE_DIR}/lib)
 target_link_libraries(kilrogg-send PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi user32)
@@ -49,6 +50,7 @@ target_link_libraries(kilrogg-send PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi user
 add_executable(kilrogg-recv
   src/receiver/main.cpp
   src/receiver/presenter.cpp
+  src/receiver/kilrogg-recv.rc
 )
 target_include_directories(kilrogg-recv PRIVATE ${lz4_SOURCE_DIR}/lib)
 target_link_libraries(kilrogg-recv PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi d3dcompiler user32)
