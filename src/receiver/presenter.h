@@ -4,6 +4,7 @@
 #include <vector>
 
 #include <d3d11.h>
+#include <d3d11sdklayers.h>
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
@@ -34,11 +35,14 @@ private:
     Presenter() = default;
     bool init(uint32_t frame_width, uint32_t frame_height);
     void handle_resize(uint32_t w, uint32_t h);
+    void drain_debug_messages();
     static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
     HWND hwnd_ = nullptr;
     uint32_t frame_w_ = 0, frame_h_ = 0;
     bool tearing_ = false;
+    bool present_error_logged_ = false;
+    Microsoft::WRL::ComPtr<ID3D11InfoQueue> info_queue_;
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx_;

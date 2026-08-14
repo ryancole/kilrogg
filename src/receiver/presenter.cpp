@@ -87,11 +87,27 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
         return false;
     }
 
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+    // Set KILROGG_D3D_DEBUG=1 to run with the D3D11 debug layer; validation
+    // messages are echoed to stderr after each present.
+    UINT flags = 0;
+    if (GetEnvironmentVariableA("KILROGG_D3D_DEBUG", nullptr, 0) > 0) {
+        flags |= D3D11_CREATE_DEVICE_DEBUG;
+    }
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
                                    D3D11_SDK_VERSION, &device_, nullptr, &ctx_);
+    if (FAILED(hr) && (flags & D3D11_CREATE_DEVICE_DEBUG)) {
+        KRG_LOG("debug layer unavailable, falling back to normal device");
+        flags = 0;
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
+                               D3D11_SDK_VERSION, &device_, nullptr, &ctx_);
+    }
     if (FAILED(hr)) {
         KRG_LOG("D3D11CreateDevice failed (hr=0x%08lX)", hr);
         return false;
+    }
+    if (flags & D3D11_CREATE_DEVICE_DEBUG) {
+        device_.As(&info_queue_);
+        KRG_LOG("D3D11 debug layer enabled");
     }
 
     ComPtr<IDXGIDevice> dxgi_device;
@@ -129,6 +145,9 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
     ComPtr<ID3D11Texture2D> backbuffer;
     swap_->GetBuffer(0, IID_PPV_ARGS(&backbuffer));
     device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &rtv_);
+    // ResizeBuffers demands zero outstanding backbuffer references, and
+    // ShowWindow below delivers a WM_SIZE synchronously — drop ours now.
+    backbuffer.Reset();
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = frame_w_;
@@ -186,13 +205,12 @@ void Presenter::handle_resize(uint32_t w, uint32_t h) {
     rtv_.Reset();
     HRESULT hr = swap_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN,
                                       tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
-    if (FAILED(hr)) {
-        KRG_LOG("ResizeBuffers failed (hr=0x%08lX)", hr);
-        return;
-    }
+    if (FAILED(hr)) KRG_LOG("ResizeBuffers failed (hr=0x%08lX)", hr);
+    // Recreate the RTV even if the resize failed: presenting at the old
+    // backbuffer size (DXGI stretches) beats never presenting again.
     ComPtr<ID3D11Texture2D> backbuffer;
     swap_->GetBuffer(0, IID_PPV_ARGS(&backbuffer));
-    device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &rtv_);
+    if (backbuffer) device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &rtv_);
     present();
 }
 
@@ -237,7 +255,29 @@ void Presenter::present() {
     ctx_->Draw(3, 0);
 
     // Sync interval 0 + allow-tearing: never block on vblank.
-    swap_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    HRESULT hr = swap_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (FAILED(hr) && !present_error_logged_) {
+        KRG_LOG("Present failed (hr=0x%08lX)", hr);
+        present_error_logged_ = true;
+    }
+    drain_debug_messages();
+}
+
+void Presenter::drain_debug_messages() {
+    if (!info_queue_) return;
+    UINT64 count = info_queue_->GetNumStoredMessages();
+    std::vector<uint8_t> buf;
+    for (UINT64 i = 0; i < count; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(info_queue_->GetMessage(i, nullptr, &len))) continue;
+        buf.resize(len);
+        auto* msg = reinterpret_cast<D3D11_MESSAGE*>(buf.data());
+        if (SUCCEEDED(info_queue_->GetMessage(i, msg, &len))) {
+            KRG_LOG("d3d[%d]: %.*s", static_cast<int>(msg->Severity),
+                    static_cast<int>(msg->DescriptionByteLength), msg->pDescription);
+        }
+    }
+    info_queue_->ClearStoredMessages();
 }
 
 } // namespace krg
