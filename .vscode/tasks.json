@@ -23,6 +23,23 @@
             "type": "shell",
             "command": "cmake -B build",
             "problemMatcher": []
+        },
+        {
+            "label": "local test (dummy source)",
+            "type": "shell",
+            "command": "powershell -ExecutionPolicy Bypass -File etc/local-test.ps1",
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "local test (desktop capture)",
+            "type": "shell",
+            "command": "powershell -ExecutionPolicy Bypass -File etc/local-test.ps1 -Desktop",
+            "group": "test",
+            "problemMatcher": "$msCompile"
         }
     ]
 }
