@@ -33,13 +33,13 @@ uint32_t scale(uint32_t bps, double factor) {
 
 } // namespace
 
-RateControl::RateControl(uint32_t ceiling_bps, uint32_t floor_bps)
+RateControl::RateControl(uint32_t ceiling_bps, uint32_t floor_bps, uint32_t start_bps)
     : ceiling_bps_(ceiling_bps),
       floor_bps_(std::min(floor_bps, ceiling_bps)),
       // Roughly a sixteenth of the ceiling per probe: from the floor back to a
       // 40 Mbit/s ceiling takes some fifteen seconds of clean link.
       step_bps_(std::max<uint32_t>(500'000, ceiling_bps / 16)),
-      target_bps_(ceiling_bps),
+      target_bps_(start_bps ? std::clamp(start_bps, floor_bps_, ceiling_bps_) : ceiling_bps),
       // There has been no cut to cool down from, and a link that is over
       // capacity is usually over capacity from the first frame — starting the
       // window armed would sit out the first three-quarters of a second of

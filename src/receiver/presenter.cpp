@@ -258,38 +258,7 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
     // ShowWindow below delivers a WM_SIZE synchronously — drop ours now.
     backbuffer.Reset();
 
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = frame_w_;
-    td.Height = frame_h_;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (video_mode_) {
-        td.Format = DXGI_FORMAT_NV12;
-        hr = device_->CreateTexture2D(&td, nullptr, &nv12_tex_);
-        if (FAILED(hr)) {
-            KRG_LOG("NV12 texture creation failed (hr=0x%08lX)", hr);
-            return false;
-        }
-        // NV12 is sampled as two planes: R8 luma and R8G8 chroma.
-        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sv.Texture2D.MipLevels = 1;
-        sv.Format = DXGI_FORMAT_R8_UNORM;
-        KRG_HRB(device_->CreateShaderResourceView(nv12_tex_.Get(), &sv, &nv12_y_srv_));
-        sv.Format = DXGI_FORMAT_R8G8_UNORM;
-        KRG_HRB(device_->CreateShaderResourceView(nv12_tex_.Get(), &sv, &nv12_uv_srv_));
-    } else {
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        hr = device_->CreateTexture2D(&td, nullptr, &frame_tex_);
-        if (FAILED(hr)) {
-            KRG_LOG("frame texture creation failed (hr=0x%08lX)", hr);
-            return false;
-        }
-        device_->CreateShaderResourceView(frame_tex_.Get(), nullptr, &frame_srv_);
-    }
+    if (!create_frame_textures()) return false;
 
     auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob) {
         ComPtr<ID3DBlob> errors;
@@ -334,8 +303,12 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
     samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     device_->CreateSamplerState(&samp, &sampler_);
 
-    if (stats_ && !init_overlay()) {
-        KRG_LOG("stats overlay unavailable, continuing without it");
+    // Built whether or not --stats was asked for: without it the receiver has
+    // no way to say on screen that it is between connections, and a window
+    // frozen on its last frame is indistinguishable from one that is fine.
+    overlay_ = init_overlay();
+    if (!overlay_) {
+        KRG_LOG("text overlay unavailable, continuing without it");
         stats_ = false;
     }
 
@@ -344,6 +317,61 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
             waitable_ ? "waitable swapchain, 1 frame of latency"
                       : (tearing_ ? "tearing allowed" : "tearing unsupported"));
     return true;
+}
+
+bool Presenter::create_frame_textures() {
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = frame_w_;
+    td.Height = frame_h_;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (video_mode_) {
+        td.Format = DXGI_FORMAT_NV12;
+        HRESULT hr = device_->CreateTexture2D(&td, nullptr, &nv12_tex_);
+        if (FAILED(hr)) {
+            KRG_LOG("NV12 texture creation failed (hr=0x%08lX)", hr);
+            return false;
+        }
+        // NV12 is sampled as two planes: R8 luma and R8G8 chroma.
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        sv.Format = DXGI_FORMAT_R8_UNORM;
+        KRG_HRB(device_->CreateShaderResourceView(nv12_tex_.Get(), &sv, &nv12_y_srv_));
+        sv.Format = DXGI_FORMAT_R8G8_UNORM;
+        KRG_HRB(device_->CreateShaderResourceView(nv12_tex_.Get(), &sv, &nv12_uv_srv_));
+    } else {
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        HRESULT hr = device_->CreateTexture2D(&td, nullptr, &frame_tex_);
+        if (FAILED(hr)) {
+            KRG_LOG("frame texture creation failed (hr=0x%08lX)", hr);
+            return false;
+        }
+        device_->CreateShaderResourceView(frame_tex_.Get(), nullptr, &frame_srv_);
+    }
+    return true;
+}
+
+bool Presenter::set_frame_size(uint32_t frame_width, uint32_t frame_height) {
+    if (frame_width == frame_w_ && frame_height == frame_h_) return true;
+    if (frame_width == 0 || frame_height == 0) return false;
+
+    // Views first: they hold references to the textures they are cut from, and
+    // the point of this is to let the old ones go.
+    frame_srv_.Reset();
+    frame_tex_.Reset();
+    nv12_y_srv_.Reset();
+    nv12_uv_srv_.Reset();
+    nv12_tex_.Reset();
+
+    KRG_LOG("remote framebuffer is now %ux%u (was %ux%u)", frame_width, frame_height, frame_w_,
+            frame_h_);
+    frame_w_ = frame_width;
+    frame_h_ = frame_height;
+    return create_frame_textures();
 }
 
 bool Presenter::init_overlay() {
@@ -421,8 +449,12 @@ bool Presenter::init_overlay() {
     return true;
 }
 
-void Presenter::set_stats_text(const char* text) {
-    if (!stats_ || !overlay_bits_) return;
+void Presenter::set_overlay_text(const char* text) {
+    if (!overlay_ || !overlay_bits_) return;
+    if (!text || !*text) {
+        overlay_used_w_ = overlay_used_h_ = 0; // nothing for draw_overlay to draw
+        return;
+    }
 
     const size_t stride = size_t{overlay_tex_w_} * 4;
     std::memset(overlay_bits_, 0, stride * overlay_tex_h_);
@@ -594,7 +626,7 @@ void Presenter::present() {
         }
     }
 
-    if (stats_) draw_overlay(rc);
+    draw_overlay(rc); // no-op unless there is text to draw
 
     // Minimal mode: sync interval 0 + allow-tearing, never blocking on vblank.
     // Smooth mode: sync interval 1, with the wait above providing the pacing.

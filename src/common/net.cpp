@@ -88,7 +88,45 @@ SOCKET accept_client(SOCKET listener) {
     return accept(listener, nullptr, nullptr);
 }
 
-SOCKET connect_to(const std::string& host, uint16_t port) {
+namespace {
+
+// Connects with a deadline. The socket goes non-blocking for the attempt and
+// back to blocking on success, so callers get an ordinary blocking socket
+// either way.
+bool connect_within(SOCKET s, const sockaddr* addr, int addr_len, uint32_t timeout_secs) {
+    if (timeout_secs == 0) return connect(s, addr, addr_len) == 0;
+
+    u_long nonblocking = 1;
+    if (ioctlsocket(s, FIONBIO, &nonblocking) != 0) return connect(s, addr, addr_len) == 0;
+
+    bool connected = connect(s, addr, addr_len) == 0;
+    if (!connected && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writable, failed;
+        FD_ZERO(&writable);
+        FD_SET(s, &writable);
+        FD_ZERO(&failed);
+        FD_SET(s, &failed);
+        timeval tv{static_cast<long>(timeout_secs), 0};
+        // A refused connection arrives on the exception set, not the write set,
+        // and a socket that is merely writable may still have failed — so the
+        // verdict comes from SO_ERROR rather than from which set fired.
+        if (select(0, nullptr, &writable, &failed, &tv) > 0) {
+            int err = 0;
+            int len = sizeof(err);
+            connected = getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) ==
+                            0 &&
+                        err == 0;
+        }
+    }
+
+    u_long blocking = 0;
+    ioctlsocket(s, FIONBIO, &blocking);
+    return connected;
+}
+
+} // namespace
+
+SOCKET connect_to(const std::string& host, uint16_t port, uint32_t timeout_secs, bool quiet) {
     char portstr[8];
     std::snprintf(portstr, sizeof(portstr), "%u", port);
 
@@ -99,7 +137,7 @@ SOCKET connect_to(const std::string& host, uint16_t port) {
 
     addrinfo* res = nullptr;
     if (getaddrinfo(host.c_str(), portstr, &hints, &res) != 0 || !res) {
-        KRG_LOG("could not resolve host '%s'", host.c_str());
+        if (!quiet) KRG_LOG("could not resolve host '%s'", host.c_str());
         return INVALID_SOCKET;
     }
 
@@ -107,12 +145,21 @@ SOCKET connect_to(const std::string& host, uint16_t port) {
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
         s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == INVALID_SOCKET) continue;
-        if (connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) break;
+        if (connect_within(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen), timeout_secs)) break;
         closesocket(s);
         s = INVALID_SOCKET;
     }
     freeaddrinfo(res);
     return s;
+}
+
+std::string peer_address(SOCKET s) {
+    sockaddr_in addr{};
+    int len = sizeof(addr);
+    if (getpeername(s, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return {};
+    char buf[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf))) return {};
+    return buf;
 }
 
 } // namespace krg::net

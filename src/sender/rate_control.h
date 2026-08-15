@@ -52,7 +52,12 @@ public:
     // `ceiling_bps` is --bitrate: the rate to use when the link allows it and
     // the most that will ever be asked for. `floor_bps` bounds how ugly the
     // picture is allowed to get before the answer is "this link cannot do it".
-    RateControl(uint32_t ceiling_bps, uint32_t floor_bps);
+    // `start_bps` is where to begin, clamped into [floor, ceiling]; 0 means the
+    // ceiling, which is the right guess for a link nothing is known about. A
+    // client that was here a moment ago passes what it had converged on, so a
+    // reconnect over a link that is still slow does not have to rediscover it
+    // by overflowing the queue again.
+    RateControl(uint32_t ceiling_bps, uint32_t floor_bps, uint32_t start_bps = 0);
 
     // Folds one interval in and returns the target to switch to, if any.
     Decision update(const Sample& s);

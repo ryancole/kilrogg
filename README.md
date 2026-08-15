@@ -19,7 +19,11 @@ are dropped *before* encoding, never after.
 - **Capture**: DXGI Desktop Duplication of the primary output. Frames stay on
   the GPU from capture through encode — no CPU copies on the sender.
   `AcquireNextFrame` timing out on a static screen is normal and simply
-  produces no traffic.
+  produces no traffic. Between clients the capture thread is parked and the
+  duplication released: acquiring and copying a full desktop image costs the
+  same whether or not anyone is watching, and a sender left listening on an
+  idle machine should cost nothing at all (measured: zero CPU time over eight
+  seconds with no client attached).
 - **Encode**: the GPU vendor's encoder via Media Foundation
   ([mf_encoder.cpp](src/sender/mf_encoder.cpp)) — CBR, low-latency mode,
   ~40 Mbit/s default. H.264 High profile where available (its 8×8 transform is
@@ -39,6 +43,20 @@ are dropped *before* encoding, never after.
   stream is then length-prefixed Annex B packets carrying the frame's capture
   timestamp. The receiver's back-channel carries keyframe requests and clock
   probes. See [protocol.h](src/common/protocol.h).
+- **Reconnection**: a dropped connection is not the end of a session. The
+  receiver reconnects on its own — with backoff, keeping its window, its D3D
+  device and the last frame it drew, so a link that blips for a second costs a
+  second of frozen picture and a message over it rather than a trip to the
+  other machine to restart anything. Only closing the window (or Esc) ends it.
+  Before the *first* connection there is a thirty-second deadline instead:
+  that early, a failure is more likely a wrong address than a blip, and a
+  receiver that retried forever would just sit there looking like it worked.
+- **Display mode changes**: dimensions are settled at the handshake and fixed
+  for the life of a connection, so a resolution change is handled by ending the
+  connection. Capture adopts the new mode, the sender drops the client, and the
+  receiver reconnects into a fresh `Hello` carrying the new size — which it
+  adopts by recreating its textures, not its window. Alt-tabbing into a game
+  that sets its own mode used to take the sender down with it.
 - **Send queue**: packets go out on their own thread
   ([packet_sender.cpp](src/sender/packet_sender.cpp)) so a slow link never
   blocks the encoder. The queue holds a quarter second of video at the
@@ -64,6 +82,14 @@ are dropped *before* encoding, never after.
   that distinction is the difference between holding 40 Mbit/s and sawing away
   at it over megabyte peaks that drain instantly. `--no-adapt` pins the rate
   for A/B comparisons.
+  A client that reconnects picks up where its link left off rather than
+  starting at the ceiling again. This matters most in exactly the case that
+  produces reconnections: a link bad enough to drop the connection is a link
+  that would otherwise be rediscovered the only way rate control can — by
+  overflowing the send queue and spending an IDR on the recovery, on every
+  reconnect. The memory is per client address and deliberately short: exact for
+  a minute, relaxing toward the ceiling after that, forgotten after ten. A rate
+  learned on a bad afternoon should not pin the picture down for the evening.
 - **Decode/Present**: hardware decode (DXVA) on the presenter's own D3D11
   device ([mf_decoder.cpp](src/receiver/mf_decoder.cpp)); NV12 is converted to
   RGB in the pixel shader and drawn through a flip-model swapchain with sync
@@ -122,8 +148,10 @@ On the viewing machine:
 build\Release\kilrogg-recv.exe <host-ip>
 ```
 
-Esc or closing the window quits the receiver; the sender keeps listening for
-the next connection.
+Esc or closing the window quits the receiver; nothing else does. If the sender
+goes away — restarted, rebooted, or just a link that dropped — the receiver
+says so on the window and keeps trying until it comes back. The sender keeps
+listening for the next connection.
 
 Sender flags: `--bitrate N` (Mbit/s, default 40 — a ceiling, not a fixed rate),
 `--min-bitrate N` (how far the link is allowed to push it down, default 3),
@@ -143,12 +171,14 @@ asking for — on the same content HEVC used a third of H.264's bitrate here.
 ## Current limitations / roadmap
 
 - Primary monitor only; no monitor selection.
-- Display resolution changes mid-stream exit the sender rather than
-  renegotiating.
+- A display mode change costs a reconnect rather than being absorbed mid-
+  stream, which is a fraction of a second of black. One that lands while no
+  client is attached is not noticed until capture resumes, so the first client
+  after it is dropped and reconnects a frame or two in.
 - Rate control reacts rather than predicts: it learns a link is too slow by
-  filling the queue on it, so the first second or so of a link going bad still
-  costs dropped video and a resync. It also relearns from scratch on every
-  reconnect, starting each new client at `--bitrate`.
+  filling the queue on it, so the first second or so of a *new* link going bad
+  still costs dropped video and a resync. What it remembers, it remembers only
+  in memory — restarting the sender forgets every client's link.
 - Rate control assumes the encoder honours a mid-stream
   `AVEncCommonMeanBitRate`. NVENC does (measured: commanded 4 Mbit/s settles at
   ~6 on the wire, commanded 40 settles at ~41, no IDR needed). An encoder that

@@ -35,6 +35,18 @@ bool recv_all(SOCKET s, void* data, size_t len);
 
 SOCKET listen_on(uint16_t port);
 SOCKET accept_client(SOCKET listener);
-SOCKET connect_to(const std::string& host, uint16_t port);
+
+// `timeout_secs` bounds the connect itself, which matters on a reconnect loop:
+// a host that is powered off swallows the SYN rather than refusing it, and
+// Windows' own retry schedule would otherwise park the caller for some twenty
+// seconds per attempt. 0 keeps the system default. `quiet` suppresses the
+// resolve-failure log, for callers that retry and would otherwise repeat it.
+SOCKET connect_to(const std::string& host, uint16_t port, uint32_t timeout_secs = 0,
+                  bool quiet = false);
+
+// Dotted-quad address of the peer, without the port — the port is fresh on
+// every connection, so it is the wrong thing to key anything by. Empty if the
+// socket has no peer.
+std::string peer_address(SOCKET s);
 
 } // namespace krg::net
