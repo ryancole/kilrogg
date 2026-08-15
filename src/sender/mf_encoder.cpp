@@ -142,7 +142,38 @@ void MfVideoEncoder::release_transform() {
     codec_ = 0;
 }
 
+// An encoder clamps a mid-stream rate change to the rate it was built with,
+// and says nothing: an Intel MFT built at 40 Mbit/s answers a request for 50
+// with 40, reports success, and keeps encoding at 40. Nothing moves that
+// ceiling afterwards — it is settled when the output type is, and raising it
+// means building the transform again — so FrameBudget's correction for sparse
+// content would never reach the encoder at all. So the transform is built at the
+// highest rate this session can ever ask for, and stepped straight back down
+// to the rate it should start at, which leaves every later change inside the
+// clamp rather than past it.
 bool MfVideoEncoder::setup_transform(const Config& config, uint32_t codec) {
+    const uint32_t ceiling = std::max(config.bitrate_bps, config.max_bitrate_bps);
+    if (!build_transform(config, codec, ceiling)) return false;
+    if (build_bitrate_ == config.bitrate_bps) return true;
+
+    // The step down happens before streaming starts, so no frame is ever
+    // encoded at the built ceiling — provided it takes. An MFT that comes back
+    // still sitting at the ceiling would spend the whole session at several
+    // times the rate the link was promised, which is a worse problem than the
+    // one being solved, so that one is built again at the plain rate and runs
+    // with rate control switched off.
+    if (apply_bitrate(config.bitrate_bps)) return true;
+    KRG_LOG("encoder: built for %.1f Mbit/s of headroom but will not come back down to %.1f, "
+            "rebuilding at the plain rate — this encoder's bitrate is fixed for the session",
+            build_bitrate_ / 1e6, config.bitrate_bps / 1e6);
+    release_transform();
+    if (!build_transform(config, codec, config.bitrate_bps)) return false;
+    rate_changes_usable_ = false;
+    return true;
+}
+
+bool MfVideoEncoder::build_transform(const Config& config, uint32_t codec, uint32_t bitrate_bps) {
+    build_bitrate_ = bitrate_bps;
     if (!select_transform(codec)) return false;
 
     ComPtr<IMFAttributes> attrs;
@@ -267,7 +298,9 @@ bool MfVideoEncoder::try_output_type(const Config& config, uint32_t fps) {
         KRG_HR(out_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
         KRG_HR(out_type->SetGUID(MF_MT_SUBTYPE,
                                  hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264));
-        KRG_HR(out_type->SetUINT32(MF_MT_AVG_BITRATE, config.bitrate_bps));
+        // The rate the transform is built for, which is not necessarily the
+        // rate it will start at; see setup_transform.
+        KRG_HR(out_type->SetUINT32(MF_MT_AVG_BITRATE, build_bitrate_));
         KRG_HR(MFSetAttributeSize(out_type.Get(), MF_MT_FRAME_SIZE, config.width, config.height));
         KRG_HR(MFSetAttributeRatio(out_type.Get(), MF_MT_FRAME_RATE, fps, 1));
         KRG_HR(MFSetAttributeRatio(out_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
@@ -290,8 +323,11 @@ bool MfVideoEncoder::try_output_type(const Config& config, uint32_t fps) {
             }
         }
         if (SUCCEEDED(hr)) {
-            KRG_LOG("encoder: %s %s profile, %u Mbit/s target at %u fps", codec_name(codec_),
-                    profiles[i].name, config.bitrate_bps / 1'000'000, fps);
+            KRG_LOG("encoder: %s %s profile, %.1f Mbit/s target at %u fps%s", codec_name(codec_),
+                    profiles[i].name, config.bitrate_bps / 1e6, fps,
+                    build_bitrate_ != config.bitrate_bps
+                        ? " (built higher so the rate can be raised mid-stream)"
+                        : "");
             return true;
         }
         KRG_LOG("encoder: %s profile rejected (hr=0x%08lX)%s", profiles[i].name, hr,
@@ -330,7 +366,12 @@ void MfVideoEncoder::configure_codec(const Config& config) {
     };
 
     require(set_u32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR), "CBR");
-    require(set_u32(CODECAPI_AVEncCommonMeanBitRate, config.bitrate_bps), "mean bitrate");
+    // Both are the rate the transform is built for rather than the one it will
+    // start at (see setup_transform). The peak is what a vendor MFT sizes its
+    // internal rate control against, so it has to carry the headroom too or
+    // the clamp simply moves from one setting to the other.
+    require(set_u32(CODECAPI_AVEncCommonMeanBitRate, build_bitrate_), "mean bitrate");
+    set_u32(CODECAPI_AVEncCommonMaxBitRate, build_bitrate_);
     require(set_u32(CODECAPI_AVEncMPVDefaultBPictureCount, 0), "zero B-frames");
     require(set_bool(CODECAPI_AVEncCommonRealTime, true), "realtime mode");
     // Whether this one takes decides whether the MFT holds frames internally,
@@ -497,35 +538,54 @@ void MfVideoEncoder::request_keyframe() {
     }
 }
 
-bool MfVideoEncoder::set_bitrate(uint32_t bitrate_bps) {
+// configure_codec's warning applies here too: a vendor MFT can accept a
+// setting after the output type is set and encode with its own anyway. A
+// readback that disagrees proves the change was dropped; one that agrees
+// proves only that the number was stored, which is why the 5-second stats line
+// reports the wire rate next to the target rather than trusting this.
+bool MfVideoEncoder::apply_bitrate(uint32_t bitrate_bps) {
     ComPtr<ICodecAPI> codec;
     if (FAILED(transform_.As(&codec))) return false;
 
     VARIANT v{};
     v.vt = VT_UI4;
     v.ulVal = bitrate_bps;
-    std::lock_guard lock(mutex_);
-    if (FAILED(codec->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v))) {
-        KRG_LOG("encoder: mean bitrate not settable mid-stream, rate stays at the initial target");
-        return false;
-    }
+    if (FAILED(codec->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v))) return false;
 
-    // configure_codec's warning applies here too: a vendor MFT can accept a
-    // setting after the output type is set and encode with its own anyway. A
-    // readback that disagrees proves the change was dropped; one that agrees
-    // proves nothing, which is why the 5-second stats line reports the wire
-    // rate next to the target rather than trusting this.
-    if (!bitrate_readback_checked_) {
-        bitrate_readback_checked_ = true;
-        VARIANT got{};
-        if (SUCCEEDED(codec->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &got))) {
-            if (got.vt != VT_UI4 || got.ulVal != bitrate_bps) {
-                KRG_LOG("encoder: bitrate change did not read back (asked %u, got %u) — this "
-                        "encoder may ignore rate control; --no-adapt pins the rate instead",
-                        bitrate_bps, got.vt == VT_UI4 ? got.ulVal : 0);
-            }
-            VariantClear(&got);
-        }
+    VARIANT got{};
+    if (FAILED(codec->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &got))) {
+        return true; // nothing to check against; the SetValue is all there is
+    }
+    // Exactness is not required — an MFT is entitled to round the rate to its
+    // own granularity, and one that reports in kbit/s does. What this is
+    // looking for is the failure the whole dance exists for: an answer still
+    // sitting up at the rate the transform was built with, which is a long way
+    // from anything rounding explains.
+    const uint32_t read = got.vt == VT_UI4 ? got.ulVal : 0;
+    VariantClear(&got);
+    const bool took = read && std::max(read, bitrate_bps) - std::min(read, bitrate_bps) <=
+                                  bitrate_bps / 10;
+    if (!took) {
+        KRG_LOG("encoder: bitrate change did not read back (asked %u, got %u)", bitrate_bps, read);
+    }
+    return took;
+}
+
+bool MfVideoEncoder::set_bitrate(uint32_t bitrate_bps) {
+    // An MFT that already proved it ignores rate changes is not asked again;
+    // saying so is what stops the caller commanding rates that do nothing.
+    if (!rate_changes_usable_) return false;
+    // Never ask past what the transform was built for. The MFT would clamp the
+    // request to it and report success either way, so the request would be a
+    // lie told to the caller as much as to the encoder.
+    const uint32_t want = std::min(bitrate_bps, build_bitrate_);
+
+    std::lock_guard lock(mutex_);
+    if (!apply_bitrate(want)) {
+        KRG_LOG("encoder: mean bitrate not settable mid-stream, rate stays where it is; "
+                "--no-adapt pins it deliberately instead");
+        rate_changes_usable_ = false;
+        return false;
     }
     return true;
 }

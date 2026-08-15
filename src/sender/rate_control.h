@@ -101,6 +101,17 @@ private:
 // multiplier does damage, and one interval of it is enough.
 class FrameBudget {
 public:
+    // Ceiling on the correction. The cost of being wrong is one interval spent
+    // encoding at the stale multiplier before the next sample pulls it down, so
+    // this bounds that burst against the send queue's quarter-second budget.
+    // It still covers the case this exists for: anything at a third of the
+    // panel's rate or better is corrected in full.
+    //
+    // Public because it also bounds what the encoder can be asked for, and an
+    // encoder has to be built for the most it will ever be asked for — a rate
+    // change past the rate it was built with is clamped away without a word.
+    static constexpr double kMaxMultiplier = 3.0;
+
     // `configured_fps` is what the encoder was told, i.e. what it divides by.
     explicit FrameBudget(uint32_t configured_fps) : configured_fps_(configured_fps) {}
 
@@ -116,12 +127,6 @@ public:
     double multiplier() const { return multiplier_; }
 
 private:
-    // Ceiling on the correction. The cost of being wrong is one interval spent
-    // encoding at the stale multiplier before the next sample pulls it down, so
-    // this bounds that burst against the send queue's quarter-second budget.
-    // It still covers the case this exists for: anything at a third of the
-    // panel's rate or better is corrected in full.
-    static constexpr double kMaxMultiplier = 3.0;
     // Per-interval climb. At a 200 ms interval this is a couple of seconds from
     // no correction to the ceiling — slow enough that content settling at a new
     // rate is followed rather than chased.
