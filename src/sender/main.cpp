@@ -787,7 +787,7 @@ int run(int argc, char** argv) {
     // pretends it is rather than the size it has.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (opt.show_displays) {
-        print_displays(list_displays());
+        print_displays(enumerate_displays());
         return 0;
     }
     // A zero ceiling would leave the controller nothing to work with, and a

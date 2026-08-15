@@ -73,6 +73,21 @@ std::map<std::wstring, std::string> monitor_names() {
     return out;
 }
 
+// Said plainly, because the alternative is a discrete GPU that simply does not
+// appear in the listing. Desktop Duplication duplicates an output, and an
+// output exists on the adapter its cable runs to — which on a hybrid laptop is
+// the integrated GPU for the built-in panel, whatever the discrete card is
+// doing the rendering. There is no capturing "from" the other one.
+void print_adapter_notes(const DisplayList& list) {
+    for (const std::string& a : list.adapters_without_displays) {
+        KRG_LOG("  --  %s has no display attached, so there is nothing on it to duplicate. On a "
+                "hybrid laptop the panel is wired to the integrated GPU and the discrete card "
+                "renders through it; an external monitor on a port wired to the discrete card, "
+                "or forcing that card in the GPU control panel, is what makes it capturable.",
+                a.c_str());
+    }
+}
+
 bool is_primary(HMONITOR mon) {
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
@@ -87,8 +102,8 @@ std::string DisplayDevice::label() const {
     return s;
 }
 
-std::vector<DisplayDevice> list_displays() {
-    std::vector<DisplayDevice> out;
+DisplayList enumerate_displays() {
+    DisplayList out;
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
         KRG_LOG("CreateDXGIFactory1 failed; no display could be enumerated");
@@ -101,6 +116,7 @@ std::vector<DisplayDevice> list_displays() {
         if (FAILED(factory->EnumAdapters1(ai, &adapter))) break;
         DXGI_ADAPTER_DESC1 ad{};
         adapter->GetDesc1(&ad);
+        size_t attached = 0;
         for (UINT oi = 0;; ++oi) {
             ComPtr<IDXGIOutput> output;
             if (FAILED(adapter->EnumOutputs(oi, &output))) break;
@@ -110,6 +126,7 @@ std::vector<DisplayDevice> list_displays() {
             // what keeps the software adapters (Basic Render Driver, WARP) out
             // of the list without having to name them.
             if (FAILED(output->GetDesc(&od)) || !od.AttachedToDesktop) continue;
+            ++attached;
 
             DisplayDevice d;
             d.adapter_obj = adapter;
@@ -124,29 +141,39 @@ std::vector<DisplayDevice> list_displays() {
             d.height = static_cast<uint32_t>(od.DesktopCoordinates.bottom -
                                              od.DesktopCoordinates.top);
             d.primary = is_primary(od.Monitor);
-            out.push_back(std::move(d));
+            out.displays.push_back(std::move(d));
+        }
+        // A real GPU with nothing wired to it. The software adapters are not
+        // worth mentioning — nobody expected to capture the Basic Render
+        // Driver — but a discrete card sitting silently absent from the
+        // listing is the single most confusing thing this command can do.
+        if (attached == 0 && !(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            out.adapters_without_displays.push_back(narrow(ad.Description));
         }
     }
     return out;
 }
 
-void print_displays(const std::vector<DisplayDevice>& displays) {
-    if (displays.empty()) {
+void print_displays(const DisplayList& list) {
+    if (list.displays.empty()) {
         KRG_LOG("no display is attached to this machine");
-        return;
+    } else {
+        KRG_LOG("displays --display can name, by index or by any part of the text:");
+        for (size_t i = 0; i < list.displays.size(); ++i) {
+            const DisplayDevice& d = list.displays[i];
+            KRG_LOG("  %zu  %ux%u at (%d,%d)%s  %s", i, d.width, d.height, d.x, d.y,
+                    d.primary ? "  [primary, the default]" : "", d.label().c_str());
+        }
     }
-    KRG_LOG("displays --display can name, by index or by any part of the text:");
-    for (size_t i = 0; i < displays.size(); ++i) {
-        const DisplayDevice& d = displays[i];
-        KRG_LOG("  %zu  %ux%u at (%d,%d)%s  %s", i, d.width, d.height, d.x, d.y,
-                d.primary ? "  [primary, the default]" : "", d.label().c_str());
-    }
+
+    print_adapter_notes(list);
 }
 
-const DisplayDevice* select_display(const std::vector<DisplayDevice>& displays,
-                                    const std::string& selector) {
+const DisplayDevice* select_display(const DisplayList& list, const std::string& selector) {
+    const std::vector<DisplayDevice>& displays = list.displays;
     if (displays.empty()) {
         KRG_LOG("no display is attached to this machine, so there is nothing to capture");
+        print_adapter_notes(list);
         return nullptr;
     }
     if (selector.empty()) {
@@ -164,7 +191,7 @@ const DisplayDevice* select_display(const std::vector<DisplayDevice>& displays,
         if (i < displays.size()) return &displays[i];
         KRG_LOG("--display %s: this machine has %zu, numbered 0 to %zu", selector.c_str(),
                 displays.size(), displays.size() - 1);
-        print_displays(displays);
+        print_displays(list);
         return nullptr;
     }
 
@@ -182,7 +209,7 @@ const DisplayDevice* select_display(const std::vector<DisplayDevice>& displays,
         KRG_LOG("--display %s: %zu displays' names contain that; name one of them or use its "
                 "index", selector.c_str(), matches);
     }
-    print_displays(displays);
+    print_displays(list);
     return nullptr;
 }
 

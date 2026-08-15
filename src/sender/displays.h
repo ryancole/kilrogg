@@ -34,10 +34,22 @@ struct DisplayDevice {
     std::string label() const;
 };
 
-// Every output currently attached to the desktop, adapter by adapter, in the
-// order --display numbers them from 0. Empty when DXGI cannot be reached or
-// nothing is attached, which is a machine with no desktop to duplicate.
-std::vector<DisplayDevice> list_displays();
+struct DisplayList {
+    // Every output currently attached to the desktop, adapter by adapter, in
+    // the order --display numbers them from 0. Empty on a machine with no
+    // desktop to duplicate, or when DXGI could not be reached at all.
+    std::vector<DisplayDevice> displays;
+
+    // Hardware adapters that came back with no attached output, by name. They
+    // are not choices — there is nothing on them to duplicate — but leaving
+    // them out of the listing entirely is how a hybrid laptop's discrete GPU
+    // looks like a GPU the sender failed to notice, when in fact it is a GPU
+    // with no screen wired to it. Named so the listing can say which.
+    std::vector<std::string> adapters_without_displays;
+};
+
+// One walk over every adapter and every output it owns.
+DisplayList enumerate_displays();
 
 // Resolves what the operator asked for: an index into the list above, or a
 // case-insensitive substring of a display's label. An empty selector picks the
@@ -45,10 +57,9 @@ std::vector<DisplayDevice> list_displays();
 // why if nothing matches, or if a name matches more than one display —
 // silently capturing a different screen than the one that was named is worse
 // than refusing to start.
-const DisplayDevice* select_display(const std::vector<DisplayDevice>& displays,
-                                    const std::string& selector);
+const DisplayDevice* select_display(const DisplayList& list, const std::string& selector);
 
 // Writes the listing --list-displays prints.
-void print_displays(const std::vector<DisplayDevice>& displays);
+void print_displays(const DisplayList& list);
 
 } // namespace krg

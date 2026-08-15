@@ -130,7 +130,7 @@ bool convert_cursor_shape(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& si, const uint8
 } // namespace
 
 std::unique_ptr<DxgiCapture> DxgiCapture::create(const std::string& display_selector) {
-    const std::vector<DisplayDevice> displays = list_displays();
+    const DisplayList displays = enumerate_displays();
     const DisplayDevice* chosen = select_display(displays, display_selector);
     if (!chosen) return nullptr;
     std::unique_ptr<DxgiCapture> cap(new DxgiCapture());
