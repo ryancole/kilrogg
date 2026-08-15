@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <memory>
 #include <mutex>
 
@@ -40,8 +41,19 @@ public:
     bool next_frame_texture(Microsoft::WRL::ComPtr<ID3D11Texture2D>& out);
 
     Microsoft::WRL::ComPtr<ID3D11Device> device() const { return device_; }
-    uint32_t width() const override { return width_; }
-    uint32_t height() const override { return height_; }
+    uint32_t width() const override { return width_.load(std::memory_order_acquire); }
+    uint32_t height() const override { return height_.load(std::memory_order_acquire); }
+
+    // Drops the duplication so nothing is being captured or composited on our
+    // behalf while no client is attached; the next frame request brings it
+    // back. Capture-thread only, since it races the acquire loop otherwise.
+    void release_duplication();
+
+    // True once, after the display mode has changed under us. Dimensions on
+    // the wire are fixed for the life of a connection, so the caller's answer
+    // is to drop the client and let it reconnect against the new width() and
+    // height() — which are already updated by the time this returns true.
+    bool take_mode_change() { return mode_changed_.exchange(false); }
 
     // Cursor state updated by the capture thread; safe to poll from another
     // thread. Copies the state and returns true if it changed since
@@ -53,6 +65,9 @@ private:
     DxgiCapture() = default;
     bool init();
     bool reinit_duplication();
+    // Adopts a new display mode: publishes the dimensions and throws away the
+    // textures cut to the old ones, which are recreated lazily at the new size.
+    void adopt_mode(uint32_t new_width, uint32_t new_height);
     void update_cursor(const DXGI_OUTDUPL_FRAME_INFO& info);
     void collect_rects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector<Rect>& rects);
     // Shared acquire logic; on success `acquired` holds the desktop texture
@@ -69,7 +84,10 @@ private:
     size_t pool_index_ = 0;
     std::vector<uint8_t> metadata_;
     std::vector<uint8_t> shape_buf_; // capture thread only
-    uint32_t width_ = 0, height_ = 0;
+    // Written by the capture thread on a mode change, read by the run loop
+    // when it sets a connection's dimensions.
+    std::atomic<uint32_t> width_{0}, height_{0};
+    std::atomic<bool> mode_changed_{false};
     uint32_t frame_id_ = 0;
     bool first_frame_ = true;
 

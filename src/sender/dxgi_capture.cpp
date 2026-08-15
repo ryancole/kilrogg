@@ -129,27 +129,7 @@ bool DxgiCapture::init() {
 
     if (!reinit_duplication()) return false;
 
-    DXGI_OUTDUPL_DESC desc{};
-    dup_->GetDesc(&desc);
-    width_ = desc.ModeDesc.Width;
-    height_ = desc.ModeDesc.Height;
-
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = width_;
-    td.Height = height_;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_STAGING;
-    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    hr = device_->CreateTexture2D(&td, nullptr, &staging_);
-    if (FAILED(hr)) {
-        KRG_LOG("staging texture creation failed (hr=0x%08lX)", hr);
-        return false;
-    }
-
-    KRG_LOG("capturing primary output at %ux%u", width_, height_);
+    KRG_LOG("capturing primary output at %ux%u", width(), height());
     return true;
 }
 
@@ -167,14 +147,39 @@ bool DxgiCapture::reinit_duplication() {
 
     DXGI_OUTDUPL_DESC desc{};
     dup_->GetDesc(&desc);
-    if (width_ != 0 && (desc.ModeDesc.Width != width_ || desc.ModeDesc.Height != height_)) {
-        KRG_LOG("display resolution changed (%ux%u -> %ux%u); not supported yet, exiting",
-                width_, height_, desc.ModeDesc.Width, desc.ModeDesc.Height);
-        std::exit(1);
-    }
+    adopt_mode(desc.ModeDesc.Width, desc.ModeDesc.Height);
 
     first_frame_ = true;
     return true;
+}
+
+void DxgiCapture::adopt_mode(uint32_t new_width, uint32_t new_height) {
+    const uint32_t old_w = width_.load(std::memory_order_relaxed);
+    const uint32_t old_h = height_.load(std::memory_order_relaxed);
+    if (new_width == old_w && new_height == old_h) return;
+
+    // The pool and staging textures are cut to the old mode and the encoder on
+    // the other side of the mailbox is configured for it, so both go. They are
+    // recreated lazily at the new size on the next frame; the flag is what
+    // tells the run loop to rebuild the encoder and the connection to match.
+    for (auto& tex : pool_) tex.Reset();
+    staging_.Reset();
+    height_.store(new_height, std::memory_order_relaxed);
+    width_.store(new_width, std::memory_order_release);
+
+    if (old_w != 0) {
+        KRG_LOG("display mode changed (%ux%u -> %ux%u), renegotiating with the client", old_w,
+                old_h, new_width, new_height);
+        mode_changed_.store(true, std::memory_order_release);
+    }
+}
+
+void DxgiCapture::release_duplication() {
+    if (!dup_) return;
+    dup_.Reset();
+    // A mode change that lands while we are not looking goes unnoticed until
+    // the duplication comes back; reinit_duplication() picks it up then.
+    first_frame_ = true;
 }
 
 void DxgiCapture::update_cursor(const DXGI_OUTDUPL_FRAME_INFO& info) {
@@ -223,8 +228,9 @@ bool DxgiCapture::poll_cursor_shape(uint64_t& last_version, CursorShape& out) {
 }
 
 void DxgiCapture::collect_rects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector<Rect>& rects) {
+    const uint32_t w = width(), h = height();
     if (first_frame_ || info.TotalMetadataBufferSize == 0) {
-        if (first_frame_) rects.push_back({0, 0, width_, height_});
+        if (first_frame_) rects.push_back({0, 0, w, h});
         return;
     }
 
@@ -235,7 +241,7 @@ void DxgiCapture::collect_rects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector
                                          reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(metadata_.data()),
                                          &move_bytes);
     if (FAILED(hr)) {
-        rects.assign(1, {0, 0, width_, height_}); // can't trust metadata: resend everything
+        rects.assign(1, {0, 0, w, h}); // can't trust metadata: resend everything
         return;
     }
     auto* moves = reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(metadata_.data());
@@ -249,7 +255,7 @@ void DxgiCapture::collect_rects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector
     hr = dup_->GetFrameDirtyRects(static_cast<UINT>(metadata_.size()),
                                   reinterpret_cast<RECT*>(metadata_.data()), &dirty_bytes);
     if (FAILED(hr)) {
-        rects.assign(1, {0, 0, width_, height_});
+        rects.assign(1, {0, 0, w, h});
         return;
     }
     auto* dirty = reinterpret_cast<RECT*>(metadata_.data());
@@ -312,10 +318,11 @@ bool DxgiCapture::next_frame_texture(ComPtr<ID3D11Texture2D>& out) {
     std::vector<Rect> rects;
     if (!acquire(acquired, have_rects, rects)) return false;
 
+    // Recreated here rather than at init so a mode change can simply drop them.
     if (!pool_[0]) {
         D3D11_TEXTURE2D_DESC td{};
-        td.Width = width_;
-        td.Height = height_;
+        td.Width = width();
+        td.Height = height();
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -346,6 +353,25 @@ bool DxgiCapture::next_frame(Frame& out) {
     std::vector<Rect> rects;
     if (!acquire(acquired, have_rects, rects)) return false;
 
+    const uint32_t width_now = width(), height_now = height();
+    if (!staging_) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = width_now;
+        td.Height = height_now;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        HRESULT thr = device_->CreateTexture2D(&td, nullptr, &staging_);
+        if (FAILED(thr)) {
+            KRG_LOG("staging texture creation failed (hr=0x%08lX)", thr);
+            dup_->ReleaseFrame();
+            return false;
+        }
+    }
+
     context_->CopyResource(staging_.Get(), acquired.Get());
     dup_->ReleaseFrame();
 
@@ -355,13 +381,13 @@ bool DxgiCapture::next_frame(Frame& out) {
         KRG_LOG("staging map failed (hr=0x%08lX)", hr);
         return false;
     }
-    out.width = width_;
-    out.height = height_;
-    out.pixels.resize(size_t{width_} * height_ * 4);
+    out.width = width_now;
+    out.height = height_now;
+    out.pixels.resize(size_t{width_now} * height_now * 4);
     const auto* src = static_cast<const uint8_t*>(map.pData);
-    for (uint32_t y = 0; y < height_; ++y) {
-        std::memcpy(out.pixels.data() + size_t{y} * width_ * 4,
-                    src + size_t{y} * map.RowPitch, size_t{width_} * 4);
+    for (uint32_t y = 0; y < height_now; ++y) {
+        std::memcpy(out.pixels.data() + size_t{y} * width_now * 4,
+                    src + size_t{y} * map.RowPitch, size_t{width_now} * 4);
     }
     context_->Unmap(staging_.Get(), 0);
 

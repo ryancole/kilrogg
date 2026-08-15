@@ -1,10 +1,12 @@
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,6 +31,22 @@ struct Options {
     bool waitable = false;
     bool stats = false;
 };
+
+// Bounds one connect attempt. A sender that is powered off swallows the SYN
+// rather than refusing it, and the window is not pumped while we are inside
+// connect() — Windows' own retry schedule would freeze it for twenty seconds
+// at a time.
+constexpr uint32_t kConnectTimeoutSecs = 2;
+
+// How long to keep trying before the first connection ever succeeds. A failure
+// this early usually means a wrong address or a sender that is not running, and
+// a receiver that retried forever would just sit there looking like it worked.
+// After a session has existed the same failure means the link blipped, which is
+// exactly what the reconnect loop is for, so from then on there is no deadline.
+constexpr auto kFirstConnectDeadline = std::chrono::seconds(30);
+
+constexpr int kMinBackoffMs = 250;
+constexpr int kMaxBackoffMs = 2000;
 
 // ---------------------------------------------------------------------------
 // KRG1: LZ4 dirty rects.
@@ -85,10 +103,9 @@ void receive_loop_lz4(SOCKET s, uint32_t width, uint32_t height, Mailbox<UpdateB
     }
 }
 
-int run_lz4(SOCKET s, const Hello& hello) {
-    auto presenter = Presenter::create(hello.width, hello.height);
-    if (!presenter) return 1;
-
+// True when the user closed the window, i.e. the process is done; false when
+// only the connection ended and reconnecting is the right answer.
+bool run_lz4(SOCKET s, const Hello& hello, Presenter& presenter) {
     // Latest-wins with ordered merge: if the present loop is behind, prepend
     // the pending (older) batch so rects still apply oldest-first.
     Mailbox<UpdateBatch> mailbox([](UpdateBatch& incoming, UpdateBatch& pending) {
@@ -104,16 +121,21 @@ int run_lz4(SOCKET s, const Hello& hello) {
         mailbox.stop();
     });
 
+    bool quit = false;
     uint32_t presented = 0;
-    while (presenter->pump()) {
+    for (;;) {
+        if (!presenter.pump()) {
+            quit = true;
+            break;
+        }
         if (net_dead) {
             KRG_LOG("connection closed");
             break;
         }
         auto batch = mailbox.pop_for(std::chrono::milliseconds(2));
         if (batch) {
-            presenter->apply(batch->updates);
-            presenter->present();
+            presenter.apply(batch->updates);
+            presenter.present();
             if (++presented == 1) KRG_LOG("first frame presented");
         }
     }
@@ -121,7 +143,7 @@ int run_lz4(SOCKET s, const Hello& hello) {
     shutdown(s, SD_BOTH); // unblocks the recv thread without freeing the handle
     rx.join();
     closesocket(s);
-    return 0;
+    return quit;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,17 +275,22 @@ private:
     double encode_ms_ = 0, decode_ms_ = 0, queue_ms_ = 0, network_ms_ = 0, e2e_ms_ = 0;
 };
 
-int run_video(SOCKET s, const Hello& hello, const Options& opt) {
-    Presenter::Options popt;
-    popt.video_mode = true;
-    popt.waitable = opt.waitable;
-    popt.stats = opt.stats;
-    auto presenter = Presenter::create(hello.width, hello.height, popt);
-    if (!presenter) return 1;
-
+// True when the user closed the window; false when only the connection ended.
+bool run_video(SOCKET s, const Hello& hello, const Options& opt, Presenter& presenter) {
     auto decoder =
-        MfVideoDecoder::create(presenter->device(), hello.width, hello.height, hello.codec);
-    if (!decoder) return 1;
+        MfVideoDecoder::create(presenter.device(), hello.width, hello.height, hello.codec);
+    if (!decoder) {
+        closesocket(s);
+        // A decoder this receiver advertised and then could not build is not
+        // going to appear on a retry, so this ends the process rather than
+        // spinning on it.
+        KRG_LOG("no decoder for the codec the sender picked");
+        return true;
+    }
+
+    // The cursor belongs to the connection that reported it; a reconnect draws
+    // nothing until the new sender says where it is, which it does immediately.
+    presenter.set_cursor_pos(0, 0, false);
 
     ControlChannel control(s);
     ClockSync clock;
@@ -311,17 +338,17 @@ int run_video(SOCKET s, const Hello& hello, const Options& opt) {
                     break;
                 }
                 if (cu.has_shape) {
-                    presenter->set_cursor_shape(cu.width, cu.height, payload.data() + sizeof(cu),
-                                                payload.data() + sizeof(cu) + pixels * 4);
+                    presenter.set_cursor_shape(cu.width, cu.height, payload.data() + sizeof(cu),
+                                               payload.data() + sizeof(cu) + pixels * 4);
                 }
-                presenter->set_cursor_pos(cu.x, cu.y, cu.visible != 0);
+                presenter.set_cursor_pos(cu.x, cu.y, cu.visible != 0);
                 frame_ready.push(FrameTiming{}); // repaint even with no video frame
                 continue;
             }
 
             bool ok = decoder->decode(payload.data(), payload.size(),
                                       [&](ID3D11Texture2D* tex, UINT sub) {
-                                          presenter->copy_video_frame(tex, sub);
+                                          presenter.copy_video_frame(tex, sub);
                                           // One decoded frame per packet, so the
                                           // header's timings belong to this frame:
                                           // B-frames are off and both ends run in
@@ -349,12 +376,17 @@ int run_video(SOCKET s, const Hello& hello, const Options& opt) {
     });
 
     const char* codec_name = hello.codec == kCodecHevc ? "hevc" : "h264";
+    bool quit = false;
     uint32_t presented = 0;
     int64_t next_ping_us = 0, next_overlay_us = 0, overlay_t0_us = now_us();
     // Probe quickly at first so the offset estimate is usable within a second,
     // then back off: what it is really tracking is drift, which is slow.
     int pings_sent = 0;
-    while (presenter->pump()) {
+    for (;;) {
+        if (!presenter.pump()) {
+            quit = true;
+            break;
+        }
         if (net_dead) {
             KRG_LOG("connection closed");
             break;
@@ -368,18 +400,18 @@ int run_video(SOCKET s, const Hello& hello, const Options& opt) {
 
         auto timing = frame_ready.pop_for(std::chrono::milliseconds(2));
         if (timing) {
-            presenter->present();
+            presenter.present();
             if (timing->capture_us) {
-                stats.add_frame(*timing, presenter->last_present_us(), clock);
+                stats.add_frame(*timing, presenter.last_present_us(), clock);
             }
             if (++presented == 1) KRG_LOG("first frame presented");
         }
 
         if (opt.stats && now >= next_overlay_us) {
             if (next_overlay_us) {
-                presenter->set_stats_text(
+                presenter.set_overlay_text(
                     stats.take_text(codec_name, hello.width, hello.height,
-                                    presenter->scanout_delay_ms(), clock, now - overlay_t0_us)
+                                    presenter.scanout_delay_ms(), clock, now - overlay_t0_us)
                         .c_str());
             }
             overlay_t0_us = now;
@@ -393,7 +425,76 @@ int run_video(SOCKET s, const Hello& hello, const Options& opt) {
     shutdown(s, SD_BOTH);
     rx.join();
     closesocket(s);
-    return 0;
+    return quit;
+}
+
+// Connects and performs the handshake, leaving an ordinary blocking socket on
+// success and nothing open on failure. `quiet` suppresses the per-attempt
+// logging, so a reconnect loop says what it is doing once rather than once a
+// second.
+SOCKET connect_and_handshake(const Options& opt, Hello& hello, bool quiet) {
+    SOCKET s = net::connect_to(opt.host, opt.port, kConnectTimeoutSecs, quiet);
+    if (s == INVALID_SOCKET) {
+        if (!quiet) KRG_LOG("could not connect to %s:%u", opt.host.c_str(), opt.port);
+        return INVALID_SOCKET;
+    }
+    net::set_low_latency(s);
+    // A static remote screen legitimately sends nothing for minutes, so a
+    // receive timeout would be wrong here; keepalive probes tell the two
+    // apart and surface a sender that vanished without closing.
+    net::enable_keepalive(s, 5000, 1000);
+
+    // The receiver speaks first: which codecs it can decode decides what the
+    // sender is allowed to encode.
+    ClientHello client_hello{kMagicClient, MfVideoDecoder::decodable_codecs(), 0};
+    if (client_hello.codecs == 0 && !quiet) {
+        KRG_LOG("no video decoder on this machine; only --codec lz4 senders will work");
+    }
+    if (!net::send_all(s, &client_hello, sizeof(client_hello))) {
+        if (!quiet) KRG_LOG("could not send hello to %s:%u", opt.host.c_str(), opt.port);
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+
+    // The sender answers as soon as it has picked a codec and built an encoder
+    // for it. One that accepts the connection and then says nothing is wedged,
+    // and blocking here forever would hide that behind an empty window;
+    // blocking is restored afterwards, since the stream itself is legitimately
+    // silent for minutes at a time.
+    net::set_recv_timeout(s, 5);
+    // The dimensions go straight into texture creation, and 16384 is as wide as
+    // a D3D11 texture goes — beyond that the failure would surface somewhere
+    // much less obvious than here.
+    bool ok = net::recv_all(s, &hello, sizeof(hello)) &&
+              (hello.magic == kMagic || hello.magic == kMagicVideo) && hello.width > 0 &&
+              hello.height > 0 && hello.width <= 16384 && hello.height <= 16384;
+    net::set_recv_timeout(s, 0);
+    if (!ok) {
+        if (!quiet) KRG_LOG("bad handshake from %s:%u", opt.host.c_str(), opt.port);
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    return s;
+}
+
+// Sleeps out a reconnect backoff without letting the window go unresponsive,
+// and says on it what is going on. False means the user closed it.
+bool wait_before_retry(Presenter* presenter, int ms, const char* status) {
+    if (!presenter) {
+        Sleep(static_cast<DWORD>(ms));
+        return true;
+    }
+    presenter->set_overlay_text(status);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    for (;;) {
+        if (!presenter->pump()) return false;
+        // Redrawing the last frame it received, with the status over it: a
+        // window frozen on a stale picture is otherwise indistinguishable
+        // from one that is working.
+        presenter->present();
+        if (std::chrono::steady_clock::now() >= deadline) return true;
+        Sleep(100);
+    }
 }
 
 int run(int argc, char** argv) {
@@ -423,39 +524,78 @@ int run(int argc, char** argv) {
         return 1;
     }
 
-    SOCKET s = net::connect_to(opt.host, opt.port);
-    if (s == INVALID_SOCKET) {
-        KRG_LOG("could not connect to %s:%u", opt.host.c_str(), opt.port);
-        return 1;
-    }
-    net::set_low_latency(s);
-    // A static remote screen legitimately sends nothing for minutes, so a
-    // receive timeout would be wrong here; keepalive probes tell the two
-    // apart and surface a sender that vanished without closing.
-    net::enable_keepalive(s, 5000, 1000);
+    // Created from the first handshake's dimensions and then kept: the window,
+    // its D3D device, and the last frame drawn into it all outlive a
+    // connection, so a link that drops for a second costs a second of frozen
+    // picture rather than the whole session. Nothing exists to look at before
+    // the first connection, which is why that one has a deadline.
+    std::unique_ptr<Presenter> presenter;
+    bool presenter_video_mode = false;
 
-    // The receiver speaks first: which codecs it can decode decides what the
-    // sender is allowed to encode.
-    ClientHello client_hello{kMagicClient, MfVideoDecoder::decodable_codecs(), 0};
-    if (client_hello.codecs == 0) {
-        KRG_LOG("no video decoder on this machine; only --codec lz4 senders will work");
-    }
-    if (!net::send_all(s, &client_hello, sizeof(client_hello))) {
-        KRG_LOG("could not send hello to %s:%u", opt.host.c_str(), opt.port);
-        return 1;
-    }
+    char status[128];
+    std::snprintf(status, sizeof(status), "kilrogg\nreconnecting to %s:%u...", opt.host.c_str(),
+                  opt.port);
 
-    Hello hello;
-    if (!net::recv_all(s, &hello, sizeof(hello)) ||
-        (hello.magic != kMagic && hello.magic != kMagicVideo)) {
-        KRG_LOG("bad handshake from %s:%u", opt.host.c_str(), opt.port);
-        return 1;
-    }
-    KRG_LOG("connected to %s:%u, remote desktop is %ux%u (%s)", opt.host.c_str(), opt.port,
-            hello.width, hello.height,
-            hello.magic != kMagicVideo ? "lz4" : (hello.codec == kCodecHevc ? "hevc" : "h264"));
+    bool connected_before = false;
+    int backoff_ms = kMinBackoffMs;
+    const auto started = std::chrono::steady_clock::now();
 
-    return hello.magic == kMagicVideo ? run_video(s, hello, opt) : run_lz4(s, hello);
+    for (;;) {
+        Hello hello{};
+        SOCKET s = connect_and_handshake(opt, hello, connected_before);
+        if (s == INVALID_SOCKET) {
+            if (!connected_before &&
+                std::chrono::steady_clock::now() - started >= kFirstConnectDeadline) {
+                KRG_LOG("giving up on %s:%u", opt.host.c_str(), opt.port);
+                return 1;
+            }
+            if (!wait_before_retry(presenter.get(), backoff_ms, status)) return 0;
+            backoff_ms = std::min(backoff_ms * 2, kMaxBackoffMs);
+            continue;
+        }
+        connected_before = true;
+
+        const bool video = hello.magic == kMagicVideo;
+        KRG_LOG("connected to %s:%u, remote desktop is %ux%u (%s)", opt.host.c_str(), opt.port,
+                hello.width, hello.height,
+                !video ? "lz4" : (hello.codec == kCodecHevc ? "hevc" : "h264"));
+
+        // The framebuffer format is baked into the presenter, so a sender that
+        // came back up in the other mode needs a new one. A sender that came
+        // back at a different resolution does not — only its textures do.
+        if (presenter && presenter_video_mode != video) presenter.reset();
+        if (!presenter) {
+            Presenter::Options popt;
+            popt.video_mode = video;
+            popt.waitable = opt.waitable;
+            popt.stats = opt.stats;
+            presenter = Presenter::create(hello.width, hello.height, popt);
+            if (!presenter) {
+                closesocket(s);
+                return 1;
+            }
+            presenter_video_mode = video;
+        } else if (!presenter->set_frame_size(hello.width, hello.height)) {
+            closesocket(s);
+            return 1;
+        }
+        presenter->set_overlay_text(nullptr);
+
+        const auto connected_at = std::chrono::steady_clock::now();
+        if (video ? run_video(s, hello, opt, *presenter) : run_lz4(s, hello, *presenter)) return 0;
+
+        // A connection that lasted says the two ends agree and the backoff can
+        // start over. One that did not is a sender dropping us as fast as it
+        // accepts us — a codec neither end can serve, an encoder that will not
+        // build — and reconnecting into that as fast as possible helps nobody.
+        KRG_LOG("reconnecting to %s:%u", opt.host.c_str(), opt.port);
+        if (std::chrono::steady_clock::now() - connected_at >= std::chrono::seconds(1)) {
+            backoff_ms = kMinBackoffMs;
+        } else {
+            if (!wait_before_retry(presenter.get(), backoff_ms, status)) return 0;
+            backoff_ms = std::min(backoff_ms * 2, kMaxBackoffMs);
+        }
+    }
 }
 
 } // namespace

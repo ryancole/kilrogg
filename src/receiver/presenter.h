@@ -45,6 +45,13 @@ public:
     // Drains the message queue; returns false once the window is closed.
     bool pump();
 
+    // Repoints the presenter at a differently sized remote framebuffer, for a
+    // reconnect to a sender whose display mode changed. The window keeps its
+    // own size and position — the frame is stretched to the client rect either
+    // way. Must not race copy_video_frame(), i.e. call it with no decoder
+    // attached. False leaves the presenter without a framebuffer to draw.
+    bool set_frame_size(uint32_t frame_width, uint32_t frame_height);
+
     void apply(const std::vector<RectUpdate>& updates);
     // Copies a decoded NV12 frame (array slice `subresource`) into the
     // presenter's own texture; callable from the decode thread.
@@ -58,8 +65,11 @@ public:
     void set_cursor_pos(int32_t x, int32_t y, bool visible);
     void set_cursor_shape(uint32_t w, uint32_t h, const uint8_t* bgra, const uint8_t* invert);
 
-    // Replaces the overlay text (newline-separated). Same thread as present().
-    void set_stats_text(const char* text);
+    // Replaces the overlay text (newline-separated); null or empty removes it.
+    // Carries the latency figures under --stats, and the connection's state
+    // when there is no connection to take figures from. Same thread as
+    // present().
+    void set_overlay_text(const char* text);
 
     // Sender clock is irrelevant here: this is the local clock right after the
     // most recent Present call returned.
@@ -75,6 +85,7 @@ public:
 private:
     Presenter() = default;
     bool init(uint32_t frame_width, uint32_t frame_height);
+    bool create_frame_textures();
     bool init_overlay();
     void handle_resize(uint32_t w, uint32_t h);
     void draw_overlay(const RECT& client);
@@ -86,7 +97,8 @@ private:
     bool tearing_ = false;
     bool video_mode_ = false;
     bool waitable_ = false;
-    bool stats_ = false;
+    bool stats_ = false;   // draw the latency figures; --stats
+    bool overlay_ = false; // the text machinery works at all, figures or not
     UINT swap_flags_ = 0;
     HANDLE frame_latency_waitable_ = nullptr;
     bool present_error_logged_ = false;

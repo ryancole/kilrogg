@@ -13,6 +13,7 @@
 
 #include <lz4.h>
 
+#include "common/gate.h"
 #include "common/log.h"
 #include "common/mailbox.h"
 #include "common/net.h"
@@ -136,8 +137,14 @@ int run_lz4(FrameSource& source, SOCKET listener) {
         if (area > uint64_t{w} * h) incoming.rects.assign(1, Rect{0, 0, w, h});
     });
 
+    // Parked between clients; this path pays for a frame twice over — a GPU
+    // copy and a full readback to system memory — so idling it matters more
+    // here than on the video path.
+    Gate capture_gate;
+
     std::thread capture([&] {
         for (;;) {
+            capture_gate.wait();
             Frame f;
             if (source.next_frame(f)) mailbox.push(std::move(f));
         }
@@ -161,6 +168,7 @@ int run_lz4(FrameSource& source, SOCKET listener) {
             closesocket(client);
             continue;
         }
+        capture_gate.set(true);
 
         bool need_keyframe = true;
         uint32_t stat_frames = 0;
@@ -191,6 +199,7 @@ int run_lz4(FrameSource& source, SOCKET listener) {
                 stat_t0 = now;
             }
         }
+        capture_gate.set(false);
         closesocket(client);
         KRG_LOG("client disconnected");
     }
@@ -237,6 +246,62 @@ void accumulate(PacketSender::Stats& acc, const PacketSender::Stats& st) {
     acc.queued_bytes = st.queued_bytes; // a depth, not a delta: latest wins
 }
 
+// What a client's link was last measured to carry. Rate control otherwise
+// starts every connection at the ceiling, which means a receiver that
+// reconnects — and with automatic reconnection, one that reconnects on every
+// hiccup of the very link that is too slow — rediscovers that the only way it
+// can: by overflowing the send queue and spending an IDR on the recovery.
+//
+// The memory is deliberately short. A client back within a minute has the link
+// it just had; ten minutes later it may be somewhere else entirely, and a rate
+// learned on a bad afternoon should not pin the picture down for the evening.
+// In between, the recalled rate relaxes toward the ceiling, so a stale reading
+// costs at most the difference between it and what rate control would have
+// probed its way to anyway.
+class RateMemory {
+public:
+    void remember(const std::string& peer, uint32_t bps) {
+        if (peer.empty()) return;
+        for (Entry& e : entries_) {
+            if (e.peer == peer) {
+                e.bps = bps;
+                e.at = std::chrono::steady_clock::now();
+                return;
+            }
+        }
+        if (entries_.size() >= kMaxEntries) entries_.erase(entries_.begin());
+        entries_.push_back({peer, bps, std::chrono::steady_clock::now()});
+    }
+
+    // 0 when nothing is known, which RateControl reads as "start at the
+    // ceiling" — the right guess for a link nothing has been measured about.
+    uint32_t recall(const std::string& peer, uint32_t ceiling_bps) const {
+        for (const Entry& e : entries_) {
+            if (e.peer != peer) continue;
+            const double age =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - e.at).count();
+            if (age >= kForgetSecs) return 0;
+            const uint32_t bps = std::min(e.bps, ceiling_bps);
+            if (age <= kFreshSecs) return bps;
+            const double t = (age - kFreshSecs) / (kForgetSecs - kFreshSecs);
+            return bps + static_cast<uint32_t>((ceiling_bps - bps) * t);
+        }
+        return 0;
+    }
+
+private:
+    static constexpr double kFreshSecs = 60.0;
+    static constexpr double kForgetSecs = 600.0;
+    static constexpr size_t kMaxEntries = 8;
+
+    struct Entry {
+        std::string peer;
+        uint32_t bps;
+        std::chrono::steady_clock::time_point at;
+    };
+    std::vector<Entry> entries_; // oldest first; evicted from the front
+};
+
 // Cursor packets are produced on the run loop's thread and video packets on
 // the encoder's event thread; the send queue serializes the two, so neither
 // needs a lock of its own.
@@ -262,12 +327,9 @@ int run_h264(const Options& opt, SOCKET listener) {
     ComPtr<ID3D11Device> device;
     std::unique_ptr<DxgiCapture> capture_source;
     std::unique_ptr<DummySource> dummy_source;
-    uint32_t w = 0, h = 0;
 
     if (opt.dummy) {
         dummy_source = std::make_unique<DummySource>(1280, 720);
-        w = dummy_source->width();
-        h = dummy_source->height();
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr,
                                      0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
@@ -279,22 +341,43 @@ int run_h264(const Options& opt, SOCKET listener) {
         capture_source = DxgiCapture::create();
         if (!capture_source) return 1;
         device = capture_source->device();
-        w = capture_source->width();
-        h = capture_source->height();
     }
+
+    // Read per connection rather than once: the desktop can change mode while
+    // the sender is running, and the dimensions are fixed for the life of a
+    // connection but not for the life of the process.
+    auto source_width = [&] {
+        return capture_source ? capture_source->width() : dummy_source->width();
+    };
+    auto source_height = [&] {
+        return capture_source ? capture_source->height() : dummy_source->height();
+    };
 
     // Latest-wins with no merge: video frames are complete images, and stale
     // ones can simply vanish (drops happen before encoding, never after).
     Mailbox<ComPtr<ID3D11Texture2D>> mailbox;
 
+    // Capturing costs the same GPU work whether or not anyone is watching, so
+    // the capture thread is parked between clients. On an idle machine that is
+    // the difference between copying a full desktop image every time something
+    // on screen moves and doing nothing at all.
+    Gate capture_gate;
+
     std::thread capture([&] {
         if (capture_source) {
             for (;;) {
+                if (!capture_gate.is_set()) {
+                    // Dropping the duplication is only safe from the thread
+                    // that runs the acquire loop, which is this one.
+                    capture_source->release_duplication();
+                    capture_gate.wait();
+                }
                 ComPtr<ID3D11Texture2D> tex;
                 if (capture_source->next_frame_texture(tex)) mailbox.push(std::move(tex));
             }
         } else {
             // Dummy source produces CPU frames; upload through a small pool.
+            const uint32_t w = dummy_source->width(), h = dummy_source->height();
             ComPtr<ID3D11DeviceContext> ctx;
             device->GetImmediateContext(&ctx);
             ComPtr<ID3D11Texture2D> pool[4];
@@ -310,6 +393,7 @@ int run_h264(const Options& opt, SOCKET listener) {
             for (auto& t : pool) device->CreateTexture2D(&td, nullptr, &t);
             size_t i = 0;
             for (;;) {
+                capture_gate.wait();
                 Frame f;
                 if (!dummy_source->next_frame(f)) continue;
                 ComPtr<ID3D11Texture2D>& slot = pool[i++ % std::size(pool)];
@@ -321,6 +405,7 @@ int run_h264(const Options& opt, SOCKET listener) {
     });
     capture.detach();
 
+    RateMemory rate_memory;
     for (;;) {
         SOCKET client = net::accept_client(listener);
         if (client == INVALID_SOCKET) continue;
@@ -330,12 +415,28 @@ int run_h264(const Options& opt, SOCKET listener) {
             closesocket(client);
             continue;
         }
-        KRG_LOG("client connected");
+        const std::string peer = net::peer_address(client);
+        KRG_LOG("client connected%s%s", peer.empty() ? "" : " from ", peer.c_str());
+
+        // Whatever the duplication last reported. A mode change that landed
+        // while capture was parked is not visible until it resumes below, in
+        // which case this connection is dropped a frame or two in and the
+        // receiver reconnects against the right numbers.
+        const uint32_t w = source_width(), h = source_height();
+
+        const uint32_t ceiling_bps = opt.bitrate_mbps * 1'000'000;
+        // --no-adapt makes the rate the operator's decision rather than the
+        // link's, so nothing measured about the link applies to it.
+        const uint32_t start_bps = opt.adapt ? rate_memory.recall(peer, ceiling_bps) : 0;
+        RateControl rate(ceiling_bps, opt.min_bitrate_mbps * 1'000'000, start_bps);
+        if (rate.target_bps() < ceiling_bps) {
+            KRG_LOG("starting at %.1f Mbit/s, where this client's link left off",
+                    rate.target_bps() / 1e6);
+        }
 
         // Budget the backlog in time rather than bytes; it is retuned from the
         // control interval below whenever the encoder's rate changes.
-        const uint32_t ceiling_bps = opt.bitrate_mbps * 1'000'000;
-        size_t queue_capacity = queue_budget_bytes(ceiling_bps);
+        size_t queue_capacity = queue_budget_bytes(rate.target_bps());
         PacketSender sender(client, queue_capacity);
 
         // Both ends have to agree, and either may be the one that cannot do
@@ -346,7 +447,7 @@ int run_h264(const Options& opt, SOCKET listener) {
         cfg.width = w;
         cfg.height = h;
         cfg.fps = 60;
-        cfg.bitrate_bps = ceiling_bps;
+        cfg.bitrate_bps = rate.target_bps();
         cfg.gop = opt.gop;
         cfg.codec = opt.codec;
         if (cfg.codec == kCodecHevc && !(client_hello.codecs & kCodecHevc)) {
@@ -354,7 +455,14 @@ int run_h264(const Options& opt, SOCKET listener) {
             cfg.codec = kCodecH264;
         }
         auto encoder = MfVideoEncoder::create(device, cfg);
-        if (!encoder) return 1;
+        // One client's worth of bad luck — a mode change caught mid-create, or
+        // another process holding the encoder — is not a reason to take the
+        // sender down with it. A machine with no hardware encoder at all says
+        // so once per connection attempt, which is diagnosis enough.
+        if (!encoder) {
+            KRG_LOG("could not create a hardware encoder, dropping connection");
+            continue;
+        }
         if (!(client_hello.codecs & encoder->codec())) {
             KRG_LOG("receiver decodes none of the codecs this machine can encode, "
                     "dropping connection");
@@ -364,14 +472,19 @@ int run_h264(const Options& opt, SOCKET listener) {
         Hello hello{kMagicVideo, w, h, encoder->codec()};
         if (!net::send_all(client, &hello, sizeof(hello))) continue;
 
+        // Everything that could fail is behind us, so capture can start paying
+        // for itself. The mailbox may still hold a frame from the last client
+        // (or from before a mode change), which is neither current nor
+        // necessarily the right size.
+        mailbox.clear();
+        capture_gate.set(true);
+
         // Constructed after the PacketSender so it is torn down first, while
         // the socket it reads from is still open.
         ControlReceiver control(client, sender);
 
-        // Rebuilt per connection, so each client starts optimistic and learns
-        // its own link rather than inheriting the last one's verdict.
-        RateControl rate(ceiling_bps, opt.min_bitrate_mbps * 1'000'000);
         bool rate_control_live = opt.adapt;
+        bool renegotiate = false;
         auto stat_t0 = std::chrono::steady_clock::now();
         auto ctl_t0 = stat_t0;
         PacketSender::Stats stat_acc;
@@ -399,6 +512,15 @@ int run_h264(const Options& opt, SOCKET listener) {
         CursorPos cursor_pos;
         while (!sender.dead() && !control.closed()) {
             auto now = std::chrono::steady_clock::now();
+
+            // The desktop changed mode under us. Width and height are settled
+            // at the handshake and fixed for the life of a connection, so a
+            // new connection is how the receiver learns the new ones — it
+            // reconnects on its own, and gets a correct Hello when it does.
+            if (capture_source && capture_source->take_mode_change()) {
+                renegotiate = true;
+                break;
+            }
 
             // Two ways to end up needing an IDR: the send queue threw away a
             // backlog, or the receiver failed to decode and said so. With a
@@ -474,6 +596,13 @@ int run_h264(const Options& opt, SOCKET listener) {
             }
             auto tex = mailbox.pop_for(std::chrono::milliseconds(16));
             if (tex) {
+                // Capture may have adopted a new display mode between the
+                // handshake and now; the flag that ends this connection is
+                // checked once per iteration, so a frame cut to the new mode
+                // can arrive first. The encoder is built for the old one.
+                D3D11_TEXTURE2D_DESC td{};
+                (*tex)->GetDesc(&td);
+                if (td.Width != w || td.Height != h) continue;
                 // Sampled before submitting: this is how many earlier frames
                 // the MFT is still sitting on, and therefore how many pushes
                 // it takes to get the frame we are about to hand it back out.
@@ -485,10 +614,20 @@ int run_h264(const Options& opt, SOCKET listener) {
             }
             if (!encoder->encode(last_tex.Get())) break;
         }
+        // Nothing is going to consume frames until the next client arrives.
+        capture_gate.set(false);
         // Blocks until any in-flight sink call returns, so the encoder's event
         // thread is done with `sender` before either goes out of scope below.
         encoder->set_sink(nullptr);
-        KRG_LOG("client disconnected");
+        // Only worth remembering if it was arrived at rather than commanded,
+        // and only if the encoder was actually honouring it.
+        if (rate_control_live) rate_memory.remember(peer, rate.target_bps());
+        if (renegotiate) {
+            KRG_LOG("client dropped to renegotiate at %ux%u; waiting for it to reconnect",
+                    source_width(), source_height());
+        } else {
+            KRG_LOG("client disconnected");
+        }
     }
 }
 

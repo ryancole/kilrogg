@@ -41,6 +41,14 @@ public:
         return take();
     }
 
+    // Throws away whatever is waiting. For a consumer that is about to change
+    // what it can accept — the sender rebuilding its encoder for a new display
+    // mode, with a frame cut to the old one still in the slot.
+    void clear() {
+        std::lock_guard lock(mutex_);
+        slot_.reset();
+    }
+
     void stop() {
         {
             std::lock_guard lock(mutex_);
