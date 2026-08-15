@@ -16,9 +16,21 @@ Each side is two threads joined by a single-slot, latest-wins **mailbox**
 ([mailbox.h](src/common/mailbox.h)): if a consumer falls behind, stale frames
 are dropped *before* encoding, never after.
 
-- **Capture**: DXGI Desktop Duplication of the primary output. Frames stay on
-  the GPU from capture through encode — no CPU copies on the sender.
-  `AcquireNextFrame` timing out on a static screen is normal and simply
+- **Capture**: DXGI Desktop Duplication of the primary output, asked for BGRA8
+  explicitly rather than given whatever the desktop happens to be in. With HDR
+  switched on the desktop composites as scRGB half-float, which nothing
+  downstream can use: the copy into the capture pool is a format mismatch,
+  which D3D11 answers by doing nothing rather than by failing, so the stream
+  becomes a texture nobody ever wrote to and no error says so. `DuplicateOutput1`
+  takes a list of formats the caller accepts and has DXGI convert, which is
+  Windows' own HDR-to-SDR mapping rather than one guessed at here — and it is
+  the only route available, since the GPU's video processor will not take a
+  float surface as *input* to convert either (measured on an RTX 4090:
+  unsupported outright). The format frames actually arrive in is read back from
+  the texture and treated as part of the display mode, so a machine where the
+  conversion does not happen says so at startup instead of streaming black.
+  Frames stay on the GPU from capture through encode — no CPU copies on the
+  sender. `AcquireNextFrame` timing out on a static screen is normal and simply
   produces no traffic. Between clients the capture thread is parked and the
   duplication released: acquiring and copying a full desktop image costs the
   same whether or not anyone is watching, and a sender left listening on an
@@ -36,10 +48,24 @@ are dropped *before* encoding, never after.
   display's refresh rate, tells the encoder that, and paces its own submissions
   to match: a frame that arrives early is held rather than sent, and newer
   frames replace it while it waits, so what goes in at each slot is the latest
-  one. `--fps N` overrides the reading. It is worth overriding when the content
-  cannot keep up with the panel — a 90 fps game on a 175 Hz display delivers
-  barely half the frames the encoder budgeted for, and spends barely half the
-  bitrate.
+  one. `--fps N` overrides the reading.
+- **Spending the whole bit budget** ([rate_control.cpp](src/sender/rate_control.cpp)):
+  the rate the encoder divides by is the display's, but content only reaches
+  that while something redraws the screen every single refresh. A 72 fps game
+  on a 175 Hz panel is handed 41% of the frames the encoder budgeted for and
+  spends 41% of the bitrate — measured here, 22 Mbit/s of a commanded 40. Those
+  bits are not saved, just never spent, and the picture is worse for it. So the
+  sender counts the frames it actually submits and scales what it *commands* by
+  how far short they fall, leaving the same bits to be spent on fewer, better
+  frames. The wire rate is unaffected — that is still whatever rate control
+  asked for — so the send queue's budget and the AIMD loop both go on measuring
+  the link and not the command. The correction climbs a step at a time and drops
+  at once, for the same reason rate control does: a command that turns out too
+  high is paid for in a queue overflow, which costs an IDR. It is capped at 3x,
+  which covers anything down to a third of the panel's rate; below that `--fps`
+  set to what the content really manages remains the exact answer. `--no-adapt`
+  turns this off along with the rest of rate control, so an A/B comparison is
+  still a comparison of one fixed number.
 - **Keyframes on demand**: the GOP is effectively infinite. A periodic IDR at
   3440×1440 is a bitrate spike big enough to be felt as a hitch on a
   constrained link, so instead one is emitted only when something asks: a fresh
@@ -194,14 +220,16 @@ asking for — on the same content HEVC used a third of H.264's bitrate here.
   stream, which is a fraction of a second of black. One that lands while no
   client is attached is not noticed until capture resumes, so the first client
   after it is dropped and reconnects a frame or two in.
-- The frame rate the encoder is told is the display's, not the content's, and
-  the two are only the same when something is redrawing the screen every
-  refresh. Sparse content spends proportionally less of the bitrate than was
-  asked for — measured here, a 3440×1440 desktop delivering 72 fps against a
-  175 Hz panel used 22 of a commanded 40 Mbit/s, where the same stream at a
-  matched `--fps` used 40. Rate control cannot recover this: it only ever cuts,
-  and it probes upward to the ceiling the encoder is already dividing. `--fps`
-  set to what the content actually manages is the answer.
+- Content slower than a third of the display's rate still under-spends its
+  bitrate: the correction that answers this is capped at 3x, because the cost
+  of commanding too high is a queue overflow and an IDR, and the cap bounds the
+  one control interval it takes to notice content speeding back up. A 30 fps
+  game on a 175 Hz panel is past that. `--fps` set to what the content actually
+  manages remains exact where the correction is only approximate.
+- An HDR desktop is streamed by having DXGI convert it to SDR at capture, so
+  what the receiver shows is Windows' HDR-to-SDR mapping, not the picture as
+  the local display renders it. There is no HDR path end to end: the stream is
+  8-bit BT.709 throughout.
 - Rate control reacts rather than predicts: it learns a link is too slow by
   filling the queue on it, so the first second or so of a *new* link going bad
   still costs dropped video and a resync. What it remembers, it remembers only

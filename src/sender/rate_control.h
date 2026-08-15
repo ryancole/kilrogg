@@ -75,4 +75,77 @@ private:
     int deep_intervals_ = 0;
 };
 
+// Turns the rate RateControl wants on the wire into the number the encoder has
+// to be given to produce it.
+//
+// A CBR encoder divides its bitrate by the frame rate it was configured with to
+// get a budget per frame, and spends that much on each frame it is handed. The
+// configured rate is the display's, because that is the fastest frames can
+// arrive — but content only reaches it while something is redrawing the screen
+// every single refresh. A 72 fps game on a 175 Hz panel is handed 41% of the
+// frames the encoder budgeted for and therefore spends 41% of the bitrate:
+// measured here, 22 Mbit/s of a commanded 40. The missing bits are not saved,
+// they are simply never spent, and the picture is worse for it.
+//
+// RateControl cannot recover this. It only ever cuts, and it probes upward
+// toward a ceiling the encoder is already dividing. So the correction goes
+// here: measure the rate frames are actually being submitted at, and scale the
+// commanded rate by how far short of the configured rate that falls. The wire
+// rate lands on the target; the encoder just spends the same bits on fewer,
+// better frames.
+//
+// The asymmetry is deliberate and is the same one RateControl uses. Climbing is
+// gradual because the commanded rate is a bet on the content rate holding, and
+// a bet that comes in high is paid for in a queue overflow, which costs an IDR.
+// Falling is immediate: content speeding back up is the case where a stale
+// multiplier does damage, and one interval of it is enough.
+class FrameBudget {
+public:
+    // `configured_fps` is what the encoder was told, i.e. what it divides by.
+    explicit FrameBudget(uint32_t configured_fps) : configured_fps_(configured_fps) {}
+
+    // Call once per control interval with the frames actually handed to the
+    // encoder during it. Returns the rate to command, which is `target_bps`
+    // scaled up by the shortfall — and is deliberately unchanged from the last
+    // answer unless it moved enough to be worth another call into the MFT.
+    uint32_t command(uint32_t target_bps, uint32_t frames, double secs);
+
+    // What the commanded rate is currently being multiplied by, for the stats
+    // line. 1.0 means content is keeping up with the display and nothing is
+    // being corrected.
+    double multiplier() const { return multiplier_; }
+
+private:
+    // Ceiling on the correction. The cost of being wrong is one interval spent
+    // encoding at the stale multiplier before the next sample pulls it down, so
+    // this bounds that burst against the send queue's quarter-second budget.
+    // It still covers the case this exists for: anything at a third of the
+    // panel's rate or better is corrected in full.
+    static constexpr double kMaxMultiplier = 3.0;
+    // Per-interval climb. At a 200 ms interval this is a couple of seconds from
+    // no correction to the ceiling — slow enough that content settling at a new
+    // rate is followed rather than chased.
+    static constexpr double kClimbPerInterval = 0.25;
+    // Above this share of the configured rate, content is keeping up and
+    // nothing is corrected. The gap below 1.0 is for jitter rather than
+    // generosity: a submission slot missed here and there costs a few percent
+    // and means nothing, while a content rate genuinely worth correcting is a
+    // long way further down.
+    static constexpr double kKeepingUpShare = 0.9;
+    // Below this share of the configured rate, the screen is not slow content
+    // but a still one, and there is nothing there to spend a bigger budget on.
+    // Re-measuring from a handful of frames would also be mostly noise.
+    static constexpr double kMinContentShare = 0.1;
+    // Don't re-command the MFT for less than this much of a change. A control
+    // interval holds a countable number of whole frames — fourteen or fifteen
+    // at 72 fps — so the measured share quantizes by some 7% at steady state,
+    // and a tighter threshold would re-command several times a second on noise
+    // alone. A few percent of bit budget is not worth a mid-stream call.
+    static constexpr double kCommandHysteresis = 0.08;
+
+    uint32_t configured_fps_;
+    double multiplier_ = 1.0;
+    uint32_t commanded_bps_ = 0;
+};
+
 } // namespace krg

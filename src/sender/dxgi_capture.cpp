@@ -35,6 +35,16 @@ uint32_t refresh_hz_from(const DXGI_MODE_DESC& mode) {
     return 60;
 }
 
+const char* format_name(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "BGRA8";
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "RGBA8";
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return "RGB10A2";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return "scRGB half-float (HDR)";
+    default: return "an unrecognised format";
+    }
+}
+
 Rect rect_from(const RECT& r) {
     Rect out;
     out.x = static_cast<uint32_t>(r.left < 0 ? 0 : r.left);
@@ -166,16 +176,38 @@ bool DxgiCapture::init() {
         KRG_LOG("IDXGIOutput1 unavailable — Desktop Duplication needs Windows 8+");
         return false;
     }
+    output.As(&output5_); // optional; see reinit_duplication
 
     if (!reinit_duplication()) return false;
 
-    KRG_LOG("capturing primary output at %ux%u @%uHz", width(), height(), refresh_hz());
+    KRG_LOG("capturing primary output at %ux%u @%uHz, %s", width(), height(), refresh_hz(),
+            format_name(format()));
     return true;
 }
 
 bool DxgiCapture::reinit_duplication() {
     dup_.Reset();
-    HRESULT hr = output_->DuplicateOutput(device_.Get(), &dup_);
+
+    // Ask for BGRA8 rather than take what the desktop happens to be in. With
+    // HDR switched on the desktop composites as scRGB half-float, and nothing
+    // downstream can use that: the copy into the capture pool would be a
+    // format mismatch, which D3D11 answers by doing nothing at all rather than
+    // by failing, and the GPU's video processor will not take a float surface
+    // as input to convert either (measured on an RTX 4090: input unsupported,
+    // CreateVideoProcessorInputView returns E_INVALIDARG). DuplicateOutput1
+    // takes a list of formats the caller can accept and has DXGI do the
+    // conversion, which is both less code here and Windows' own HDR-to-SDR
+    // mapping rather than one guessed at in a shader.
+    HRESULT hr = E_NOINTERFACE;
+    if (output5_) {
+        const DXGI_FORMAT accepted[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
+        hr = output5_->DuplicateOutput1(device_.Get(), 0, 1, accepted, &dup_);
+        if (FAILED(hr) && hr != E_ACCESSDENIED) {
+            KRG_LOG("DuplicateOutput1 failed (hr=0x%08lX), falling back to the untyped "
+                    "duplication", hr);
+        }
+    }
+    if (FAILED(hr)) hr = output_->DuplicateOutput(device_.Get(), &dup_);
     if (FAILED(hr)) {
         if (hr == E_ACCESSDENIED) {
             KRG_LOG("DuplicateOutput access denied (secure desktop / UAC prompt active?)");
@@ -187,17 +219,26 @@ bool DxgiCapture::reinit_duplication() {
 
     DXGI_OUTDUPL_DESC desc{};
     dup_->GetDesc(&desc);
-    adopt_mode(desc.ModeDesc.Width, desc.ModeDesc.Height, refresh_hz_from(desc.ModeDesc));
+    // The format here is a seed rather than the last word: the first acquired
+    // texture is what the copies actually have to match, and acquire() corrects
+    // this from it if the two ever disagree.
+    adopt_mode(desc.ModeDesc.Width, desc.ModeDesc.Height, refresh_hz_from(desc.ModeDesc),
+               desc.ModeDesc.Format);
 
     first_frame_ = true;
     return true;
 }
 
-void DxgiCapture::adopt_mode(uint32_t new_width, uint32_t new_height, uint32_t new_hz) {
+void DxgiCapture::adopt_mode(uint32_t new_width, uint32_t new_height, uint32_t new_hz,
+                             DXGI_FORMAT new_format) {
     const uint32_t old_w = width_.load(std::memory_order_relaxed);
     const uint32_t old_h = height_.load(std::memory_order_relaxed);
     const uint32_t old_hz = refresh_hz_.load(std::memory_order_relaxed);
-    if (new_width == old_w && new_height == old_h && new_hz == old_hz) return;
+    const auto old_format = static_cast<DXGI_FORMAT>(format_.load(std::memory_order_relaxed));
+    if (new_width == old_w && new_height == old_h && new_hz == old_hz &&
+        new_format == old_format) {
+        return;
+    }
 
     // The pool and staging textures are cut to the old mode and the encoder on
     // the other side of the mailbox is configured for it, so both go. They are
@@ -209,13 +250,17 @@ void DxgiCapture::adopt_mode(uint32_t new_width, uint32_t new_height, uint32_t n
     // 165 Hz desktop against a 60 fps bit budget.
     for (auto& tex : pool_) tex.Reset();
     staging_.Reset();
+    lz4_format_warned_ = false;
     refresh_hz_.store(new_hz, std::memory_order_relaxed);
+    format_.store(new_format, std::memory_order_relaxed);
     height_.store(new_height, std::memory_order_relaxed);
     width_.store(new_width, std::memory_order_release);
 
     if (old_w != 0) {
-        KRG_LOG("display mode changed (%ux%u @%uHz -> %ux%u @%uHz), renegotiating with the client",
-                old_w, old_h, old_hz, new_width, new_height, new_hz);
+        KRG_LOG("display mode changed (%ux%u @%uHz %s -> %ux%u @%uHz %s), renegotiating with the "
+                "client",
+                old_w, old_h, old_hz, format_name(old_format), new_width, new_height, new_hz,
+                format_name(new_format));
         mode_changed_.store(true, std::memory_order_release);
     }
 }
@@ -341,6 +386,20 @@ bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
         return false;
     }
 
+    resource.As(&acquired);
+
+    // The desktop image is whatever the desktop is in, and CopyResource between
+    // mismatched formats is not an error — it is a silent no-op, which on an
+    // HDR desktop means streaming a texture nothing ever wrote to. So the
+    // acquired texture, not the mode description, decides what everything
+    // downstream is cut to.
+    D3D11_TEXTURE2D_DESC acquired_desc{};
+    if (acquired) {
+        acquired->GetDesc(&acquired_desc);
+        adopt_mode(acquired_desc.Width, acquired_desc.Height,
+                   refresh_hz_.load(std::memory_order_relaxed), acquired_desc.Format);
+    }
+
     update_cursor(info);
 
     rects.clear();
@@ -353,7 +412,6 @@ bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
         return false;
     }
 
-    resource.As(&acquired);
     have_rects = true;
     return true;
 }
@@ -371,7 +429,12 @@ bool DxgiCapture::next_frame_texture(ComPtr<ID3D11Texture2D>& out) {
         td.Height = height();
         td.MipLevels = 1;
         td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        // Matching what was acquired rather than assuming BGRA8, because
+        // CopyResource below requires it. Asking DXGI to convert is what makes
+        // this BGRA8 in practice; on a machine where that did not happen, the
+        // copy at least still copies, and the encoder is left to report a
+        // format it cannot take when it is built.
+        td.Format = format();
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -400,6 +463,20 @@ bool DxgiCapture::next_frame(Frame& out) {
     if (!acquire(acquired, have_rects, rects)) return false;
 
     const uint32_t width_now = width(), height_now = height();
+    // Everything below reads the desktop back as 4-byte BGRA and the wire
+    // format says the same, so an HDR desktop is not something this path can
+    // carry — and half-reading a half-float surface would put convincing
+    // garbage on screen rather than failing. The video path handles it.
+    if (format() != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        if (!lz4_format_warned_) {
+            lz4_format_warned_ = true;
+            KRG_LOG("desktop is %s; --codec lz4 carries BGRA8 only, so nothing will be sent. "
+                    "Use the video path, or turn HDR off for this display.",
+                    format_name(format()));
+        }
+        dup_->ReleaseFrame();
+        return false;
+    }
     if (!staging_) {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = width_now;

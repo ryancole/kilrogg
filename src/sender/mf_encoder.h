@@ -32,6 +32,10 @@ public:
         // Frames between IDRs. 0 asks for the longest GOP the encoder will
         // accept — effectively infinite, leaving keyframes on-demand only.
         uint32_t gop = 0;
+        // What encode() will be handed. Checked against what the GPU's video
+        // processor will actually convert, so that a format it cannot take is
+        // one error at startup rather than every frame silently vanishing.
+        DXGI_FORMAT input_format = DXGI_FORMAT_B8G8R8A8_UNORM;
     };
 
     // `capture_us` is the sender-clock time the frame was captured and
@@ -45,7 +49,9 @@ public:
 
     // Sink runs on the encoder thread; pass nullptr to drop output.
     void set_sink(Sink sink);
-    bool encode(ID3D11Texture2D* bgra);
+    // The texture must be in the Config's input_format; anything else fails the
+    // conversion and the frame is dropped.
+    bool encode(ID3D11Texture2D* source);
     void request_keyframe();
     // Retargets the CBR rate mid-stream; see rate_control.h for who asks and
     // why. False means the MFT refused, and the caller should stop trying.
@@ -68,8 +74,9 @@ private:
     bool select_transform(uint32_t codec);
     bool set_output_type(const Config& config);
     void configure_codec(const Config& config);
-    bool init_video_processor(uint32_t width, uint32_t height, uint32_t fps);
-    bool convert_to_nv12(ID3D11Texture2D* bgra, Microsoft::WRL::ComPtr<IMFSample>& out);
+    bool init_video_processor(uint32_t width, uint32_t height, uint32_t fps,
+                              DXGI_FORMAT input_format);
+    bool convert_to_nv12(ID3D11Texture2D* source, Microsoft::WRL::ComPtr<IMFSample>& out);
     void event_loop();
     void on_need_input();
     void on_have_output();
