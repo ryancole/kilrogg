@@ -42,6 +42,10 @@ private:
     bool init(Microsoft::WRL::ComPtr<ID3D11Device> device, uint32_t width, uint32_t height,
               uint32_t codec);
     bool negotiate_output_type();
+    // Collects everything the MFT has ready, emitting each frame, and returns
+    // once it wants more input. False on a decode failure, i.e. the same
+    // meaning decode() gives it.
+    bool drain_output(const FrameFn& on_frame);
 
     Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> manager_;
     Microsoft::WRL::ComPtr<IMFTransform> transform_;

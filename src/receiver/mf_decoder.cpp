@@ -183,15 +183,29 @@ bool MfVideoDecoder::decode(const uint8_t* data, size_t size, const FrameFn& on_
     ++frame_index_;
 
     HRESULT hr = transform_->ProcessInput(0, in_sample.Get(), 0);
-    if (FAILED(hr) && hr != MF_E_NOTACCEPTING) {
+    if (hr == MF_E_NOTACCEPTING) {
+        // The MFT is holding output it wants collected before it will take
+        // anything else. Drain and offer the packet again rather than let it
+        // go: a dropped packet leaves every P-frame after it referencing a
+        // frame the decoder never saw, and reporting success for it means
+        // nothing ever asks for the IDR that would fix that — which, with the
+        // sender's GOP effectively infinite, is the only thing that can.
+        if (!drain_output(on_frame)) return false;
+        hr = transform_->ProcessInput(0, in_sample.Get(), 0);
+    }
+    if (FAILED(hr)) {
         KRG_LOG("decoder ProcessInput failed (hr=0x%08lX)", hr);
         return false;
     }
 
+    return drain_output(on_frame);
+}
+
+bool MfVideoDecoder::drain_output(const FrameFn& on_frame) {
     for (;;) {
         MFT_OUTPUT_DATA_BUFFER out{};
         DWORD status = 0;
-        hr = transform_->ProcessOutput(0, 1, &out, &status);
+        HRESULT hr = transform_->ProcessOutput(0, 1, &out, &status);
         if (out.pEvents) out.pEvents->Release();
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return true;
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {

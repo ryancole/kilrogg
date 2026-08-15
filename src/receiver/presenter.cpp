@@ -112,7 +112,10 @@ LRESULT CALLBACK Presenter::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         if (wp == VK_ESCAPE) DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
-        PostQuitMessage(0);
+        // Only the live presenter's window ends the process. One being torn
+        // down has already detached itself below, and its WM_DESTROY must not
+        // take the window that replaced it down with it.
+        if (self) PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
@@ -136,6 +139,20 @@ Presenter::~Presenter() {
     if (overlay_bmp_) DeleteObject(overlay_bmp_);
     if (overlay_font_) DeleteObject(overlay_font_);
     if (frame_latency_waitable_) CloseHandle(frame_latency_waitable_);
+
+    if (hwnd_) {
+        // The swapchain is bound to this window, so it goes first.
+        rtv_.Reset();
+        swap_.Reset();
+        // Detach before destroying: pump() peeks thread-wide, so a window left
+        // behind here would go on feeding messages to wnd_proc with a
+        // GWLP_USERDATA pointing at these bytes. Zeroing it is what makes the
+        // remaining messages — WM_DESTROY included — find no presenter and do
+        // nothing, rather than call into one that no longer exists.
+        SetWindowLongPtrA(hwnd_, GWLP_USERDATA, 0);
+        DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+    }
 }
 
 bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
