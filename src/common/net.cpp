@@ -1,5 +1,7 @@
 #include "common/net.h"
 
+#include <mstcpip.h>
+
 #include <algorithm>
 #include <cstdio>
 
@@ -15,6 +17,23 @@ bool init() {
 void set_low_latency(SOCKET s) {
     BOOL on = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on), sizeof(on));
+}
+
+void set_send_timeout(SOCKET s, uint32_t seconds) {
+    DWORD ms = seconds * 1000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+}
+
+void enable_keepalive(SOCKET s, uint32_t idle_ms, uint32_t interval_ms) {
+    tcp_keepalive ka{};
+    ka.onoff = 1;
+    ka.keepalivetime = idle_ms;
+    ka.keepaliveinterval = interval_ms;
+    DWORD returned = 0;
+    if (WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &returned, nullptr,
+                 nullptr) != 0) {
+        KRG_LOG("keepalive setup failed (error %d)", WSAGetLastError());
+    }
 }
 
 bool send_all(SOCKET s, const void* data, size_t len) {

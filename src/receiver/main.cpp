@@ -211,6 +211,10 @@ int run(int argc, char** argv) {
         return 1;
     }
     net::set_low_latency(s);
+    // A static remote screen legitimately sends nothing for minutes, so a
+    // receive timeout would be wrong here; keepalive probes tell the two
+    // apart and surface a sender that vanished without closing.
+    net::enable_keepalive(s, 5000, 1000);
 
     Hello hello;
     if (!net::recv_all(s, &hello, sizeof(hello)) ||

@@ -7,7 +7,7 @@ pixels, as fast as possible.
 ## Pipeline
 
 ```
-sender:    Desktop Duplication ──► [mailbox] ──► hardware H.264 (NVENC etc.) ──► TCP (TCP_NODELAY)
+sender:    Desktop Duplication ──► [mailbox] ──► hardware H.264 (NVENC etc.) ──► [send queue] ──► TCP (TCP_NODELAY)
 receiver:  TCP ──► hardware H.264 decode ──► [mailbox] ──► D3D11 flip-model present (vsync off)
 ```
 
@@ -24,6 +24,14 @@ are dropped *before* encoding, never after.
   ~40 Mbit/s default. BGRA→NV12 conversion runs on the GPU video processor.
 - **Wire**: `Hello` then length-prefixed H.264 Annex B packets; an IDR is
   forced on every (re)connect. See [protocol.h](src/common/protocol.h).
+- **Send queue**: packets go out on their own thread
+  ([packet_sender.cpp](src/sender/packet_sender.cpp)) so a slow link never
+  blocks the encoder. The queue holds a quarter second of video at the
+  configured bitrate; when it overflows, the *whole* pending video backlog is
+  dropped and a fresh IDR is forced, since every queued P-frame after a
+  dropped one is undecodable anyway. Cursor packets are never dropped. The
+  5-second stats line reports the wire rate and the queue high-water mark, so
+  a link that cannot keep up says so explicitly.
 - **Decode/Present**: hardware decode (DXVA) on the presenter's own D3D11
   device ([mf_decoder.cpp](src/receiver/mf_decoder.cpp)); NV12 is converted to
   RGB in the pixel shader and drawn through a flip-model swapchain with sync
@@ -72,5 +80,9 @@ without capture, including over loopback.
   pointer-only updates are currently skipped).
 - Display resolution changes mid-stream exit the sender rather than
   renegotiating.
+- No adaptive bitrate: the sender encodes at `--bitrate` no matter what the
+  link can carry. Overflow is handled (video is dropped and an IDR forced,
+  and the stats line says so) but not avoided — lowering `--bitrate` is the
+  fix.
 - Requires a hardware H.264 encoder (any non-ancient GPU) and decoder.
 - Unencrypted, unauthenticated TCP — LAN/trusted networks only.
