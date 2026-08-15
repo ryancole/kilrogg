@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <d3d11.h>
@@ -37,6 +38,13 @@ public:
     void copy_video_frame(ID3D11Texture2D* nv12, UINT subresource);
     void present();
 
+    // Remote cursor overlay, drawn on top of the frame by present(). Callable
+    // from the receive thread. (x, y) is the shape's top-left in frame
+    // coordinates; `bgra` is w*h*4 straight-alpha color and `invert` is a
+    // w*h mask (255 = invert the frame pixel underneath).
+    void set_cursor_pos(int32_t x, int32_t y, bool visible);
+    void set_cursor_shape(uint32_t w, uint32_t h, const uint8_t* bgra, const uint8_t* invert);
+
     Microsoft::WRL::ComPtr<ID3D11Device> device() const { return device_; }
 
 private:
@@ -66,6 +74,17 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12_tex_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> nv12_y_srv_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> nv12_uv_srv_;
+
+    // Cursor overlay state; written by the receive thread, drawn by present().
+    std::mutex cursor_mutex_;
+    int32_t cursor_x_ = 0, cursor_y_ = 0;
+    bool cursor_visible_ = false;
+    uint32_t cursor_w_ = 0, cursor_h_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> cursor_tex_, cursor_inv_tex_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cursor_srv_, cursor_inv_srv_;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs_cursor_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> ps_cursor_, ps_cursor_nv12_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> cursor_cb_;
 };
 
 } // namespace krg

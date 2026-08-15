@@ -37,14 +37,45 @@ float4 ps_main(VSOut i) : SV_Target { return tex.Sample(smp, i.uv); }
 // NV12 (BT.709, limited range) to RGB.
 Texture2D texY  : register(t0);
 Texture2D texUV : register(t1);
-float4 ps_nv12(VSOut i) : SV_Target {
-    float y = (texY.Sample(smp, i.uv).r - 16.0 / 255.0) * (255.0 / 219.0);
-    float2 uv = (texUV.Sample(smp, i.uv).rg - 0.5) * (255.0 / 224.0);
+float3 nv12_to_rgb(float2 uv_frame) {
+    float y = (texY.Sample(smp, uv_frame).r - 16.0 / 255.0) * (255.0 / 219.0);
+    float2 uv = (texUV.Sample(smp, uv_frame).rg - 0.5) * (255.0 / 224.0);
     float3 rgb = float3(
         y + 1.5748 * uv.y,
         y - 0.1873 * uv.x - 0.4681 * uv.y,
         y + 1.8556 * uv.x);
-    return float4(saturate(rgb), 1);
+    return saturate(rgb);
+}
+float4 ps_nv12(VSOut i) : SV_Target { return float4(nv12_to_rgb(i.uv), 1); }
+
+// Cursor overlay: a small quad whose pixel shader samples the frame texture
+// itself as the background, so straight-alpha blending and XOR/invert cursor
+// pixels both work without a blend state or backbuffer read.
+cbuffer CursorCB : register(b0) {
+    float4 cur_dst; // cursor rect in NDC: x0, y0 (top-left), x1, y1
+    float4 cur_uv;  // same rect in frame UV space
+};
+struct CursorVSOut { float4 pos : SV_Position; float2 uvc : TEXCOORD0; float2 uvf : TEXCOORD1; };
+CursorVSOut vs_cursor(uint id : SV_VertexID) {
+    float2 t = float2(id & 1, id >> 1); // strip: (0,0) (1,0) (0,1) (1,1)
+    CursorVSOut o;
+    o.pos = float4(lerp(cur_dst.xy, cur_dst.zw, t), 0, 1);
+    o.uvc = t;
+    o.uvf = lerp(cur_uv.xy, cur_uv.zw, t);
+    return o;
+}
+Texture2D curColor  : register(t2);
+Texture2D curInvert : register(t3);
+float3 cursor_blend(float3 bg, float2 uvc) {
+    float4 c = curColor.Sample(smp, uvc);
+    float inv = curInvert.Sample(smp, uvc).r;
+    return lerp(lerp(bg, c.rgb, c.a), 1 - bg, inv);
+}
+float4 ps_cursor(CursorVSOut i) : SV_Target {
+    return float4(cursor_blend(tex.Sample(smp, i.uvf).rgb, i.uvc), 1);
+}
+float4 ps_cursor_nv12(CursorVSOut i) : SV_Target {
+    return float4(cursor_blend(nv12_to_rgb(i.uvf), i.uvc), 1);
 }
 )";
 
@@ -213,38 +244,41 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
         device_->CreateShaderResourceView(frame_tex_.Get(), nullptr, &frame_srv_);
     }
 
-    ComPtr<ID3DBlob> blob, errors;
-    hr = D3DCompile(kShaderSrc, sizeof(kShaderSrc) - 1, nullptr, nullptr, nullptr, "vs_main",
-                    "vs_5_0", 0, 0, &blob, &errors);
-    if (FAILED(hr)) {
-        KRG_LOG("vertex shader compile failed: %s",
-                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-        return false;
-    }
+    auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob) {
+        ComPtr<ID3DBlob> errors;
+        HRESULT chr = D3DCompile(kShaderSrc, sizeof(kShaderSrc) - 1, nullptr, nullptr, nullptr,
+                                 entry, target, 0, 0, &blob, &errors);
+        if (FAILED(chr)) {
+            KRG_LOG("%s compile failed: %s", entry,
+                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+            return false;
+        }
+        return true;
+    };
+
+    ComPtr<ID3DBlob> blob;
+    if (!compile("vs_main", "vs_5_0", blob)) return false;
     device_->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &vs_);
-
-    blob.Reset();
-    errors.Reset();
-    hr = D3DCompile(kShaderSrc, sizeof(kShaderSrc) - 1, nullptr, nullptr, nullptr, "ps_main",
-                    "ps_5_0", 0, 0, &blob, &errors);
-    if (FAILED(hr)) {
-        KRG_LOG("pixel shader compile failed: %s",
-                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-        return false;
-    }
+    if (!compile("ps_main", "ps_5_0", blob)) return false;
     device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &ps_);
-
-    blob.Reset();
-    errors.Reset();
-    hr = D3DCompile(kShaderSrc, sizeof(kShaderSrc) - 1, nullptr, nullptr, nullptr, "ps_nv12",
-                    "ps_5_0", 0, 0, &blob, &errors);
-    if (FAILED(hr)) {
-        KRG_LOG("NV12 pixel shader compile failed: %s",
-                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-        return false;
-    }
+    if (!compile("ps_nv12", "ps_5_0", blob)) return false;
     device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
                                &ps_nv12_);
+    if (!compile("vs_cursor", "vs_5_0", blob)) return false;
+    device_->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                                &vs_cursor_);
+    if (!compile("ps_cursor", "ps_5_0", blob)) return false;
+    device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                               &ps_cursor_);
+    if (!compile("ps_cursor_nv12", "ps_5_0", blob)) return false;
+    device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                               &ps_cursor_nv12_);
+
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = 32; // CursorCB: two float4s
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    KRG_HRB(device_->CreateBuffer(&bd, nullptr, &cursor_cb_));
 
     D3D11_SAMPLER_DESC samp{};
     samp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -291,6 +325,44 @@ void Presenter::apply(const std::vector<RectUpdate>& updates) {
     }
 }
 
+void Presenter::set_cursor_pos(int32_t x, int32_t y, bool visible) {
+    std::lock_guard lock(cursor_mutex_);
+    cursor_x_ = x;
+    cursor_y_ = y;
+    cursor_visible_ = visible;
+}
+
+void Presenter::set_cursor_shape(uint32_t w, uint32_t h, const uint8_t* bgra,
+                                 const uint8_t* invert) {
+    std::lock_guard lock(cursor_mutex_);
+    if (w != cursor_w_ || h != cursor_h_ || !cursor_tex_) {
+        cursor_tex_.Reset();
+        cursor_srv_.Reset();
+        cursor_inv_tex_.Reset();
+        cursor_inv_srv_.Reset();
+        cursor_w_ = cursor_h_ = 0;
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(device_->CreateTexture2D(&td, nullptr, &cursor_tex_))) return;
+        device_->CreateShaderResourceView(cursor_tex_.Get(), nullptr, &cursor_srv_);
+        td.Format = DXGI_FORMAT_R8_UNORM;
+        if (FAILED(device_->CreateTexture2D(&td, nullptr, &cursor_inv_tex_))) return;
+        device_->CreateShaderResourceView(cursor_inv_tex_.Get(), nullptr, &cursor_inv_srv_);
+        cursor_w_ = w;
+        cursor_h_ = h;
+    }
+    ctx_->UpdateSubresource(cursor_tex_.Get(), 0, nullptr, bgra, w * 4, 0);
+    ctx_->UpdateSubresource(cursor_inv_tex_.Get(), 0, nullptr, invert, w, 0);
+}
+
 void Presenter::copy_video_frame(ID3D11Texture2D* nv12, UINT subresource) {
     if (!nv12_tex_) return;
     // Decoder textures may be padded to macroblock alignment; copy only our
@@ -327,6 +399,32 @@ void Presenter::present() {
     ID3D11RenderTargetView* rtvs[] = {rtv_.Get()};
     ctx_->OMSetRenderTargets(1, rtvs, nullptr);
     ctx_->Draw(3, 0);
+
+    {
+        std::lock_guard lock(cursor_mutex_);
+        if (cursor_visible_ && cursor_srv_ && cursor_inv_srv_) {
+            // Cursor rect in frame-normalized coords; the frame fills the
+            // whole viewport, so NDC follows directly and the cursor scales
+            // with the window like everything else.
+            float x0 = cursor_x_ / static_cast<float>(frame_w_);
+            float y0 = cursor_y_ / static_cast<float>(frame_h_);
+            float x1 = (cursor_x_ + cursor_w_) / static_cast<float>(frame_w_);
+            float y1 = (cursor_y_ + cursor_h_) / static_cast<float>(frame_h_);
+            float cb[8] = {x0 * 2 - 1, 1 - y0 * 2, x1 * 2 - 1, 1 - y1 * 2, x0, y0, x1, y1};
+            ctx_->UpdateSubresource(cursor_cb_.Get(), 0, nullptr, cb, 0, 0);
+
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx_->VSSetShader(vs_cursor_.Get(), nullptr, 0);
+            ID3D11Buffer* cbs[] = {cursor_cb_.Get()};
+            ctx_->VSSetConstantBuffers(0, 1, cbs);
+            // The frame SRVs from the main draw stay bound at t0/t1 as the
+            // background the cursor shader blends against.
+            ctx_->PSSetShader(video_mode_ ? ps_cursor_nv12_.Get() : ps_cursor_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* csrvs[] = {cursor_srv_.Get(), cursor_inv_srv_.Get()};
+            ctx_->PSSetShaderResources(2, 2, csrvs);
+            ctx_->Draw(4, 0);
+        }
+    }
 
     // Sync interval 0 + allow-tearing: never block on vblank.
     HRESULT hr = swap_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);

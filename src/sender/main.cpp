@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -156,6 +157,32 @@ int run_lz4(FrameSource& source, SOCKET listener) {
 // KRG2 path: hardware H.264. Frames stay on the GPU from capture to encoder.
 // ---------------------------------------------------------------------------
 
+// Cursor packets go out on the run loop's thread while video packets go out
+// on the encoder's event thread — `send_mutex` keeps the two packet streams
+// from interleaving mid-packet.
+bool send_cursor(SOCKET s, std::mutex& send_mutex, const CursorPos& pos,
+                 const CursorShape* shape) {
+    CursorUpdate cu{};
+    cu.x = pos.x;
+    cu.y = pos.y;
+    cu.visible = pos.visible ? 1 : 0;
+    size_t extra = 0;
+    if (shape) {
+        cu.has_shape = 1;
+        cu.width = shape->width;
+        cu.height = shape->height;
+        extra = shape->bgra.size() + shape->invert.size();
+    }
+    VideoPacketHeader ph{static_cast<uint32_t>(sizeof(cu) + extra), kPacketCursor};
+    std::lock_guard lock(send_mutex);
+    if (!net::send_all(s, &ph, sizeof(ph)) || !net::send_all(s, &cu, sizeof(cu))) return false;
+    if (shape) {
+        if (!net::send_all(s, shape->bgra.data(), shape->bgra.size())) return false;
+        if (!net::send_all(s, shape->invert.data(), shape->invert.size())) return false;
+    }
+    return true;
+}
+
 int run_h264(const Options& opt, SOCKET listener) {
     ComPtr<ID3D11Device> device;
     std::unique_ptr<DxgiCapture> capture_source;
@@ -236,12 +263,14 @@ int run_h264(const Options& opt, SOCKET listener) {
         }
 
         std::atomic<bool> dead{false};
+        std::mutex send_mutex;
         auto stat_t0 = std::chrono::steady_clock::now();
         uint32_t stat_frames = 0;
         int64_t stat_bytes = 0;
 
         encoder->set_sink([&](const uint8_t* data, size_t size, bool keyframe) {
             VideoPacketHeader ph{static_cast<uint32_t>(size), keyframe ? kPacketKeyframe : 0};
+            std::lock_guard lock(send_mutex);
             if (!net::send_all(client, &ph, sizeof(ph)) || !net::send_all(client, data, size)) {
                 dead = true;
                 return;
@@ -267,7 +296,21 @@ int run_h264(const Options& opt, SOCKET listener) {
         // bounded burst, so a truly static screen stops producing traffic.
         ComPtr<ID3D11Texture2D> last_tex;
         int flush_budget = 0;
+        // Version 0 = "never sent to this client": the first poll always
+        // delivers the current shape and position to a fresh connection.
+        uint64_t cursor_pos_ver = 0, cursor_shape_ver = 0;
+        CursorPos cursor_pos;
         while (!dead) {
+            if (capture_source) {
+                CursorShape shape;
+                bool shape_changed = capture_source->poll_cursor_shape(cursor_shape_ver, shape);
+                bool pos_changed = capture_source->poll_cursor_pos(cursor_pos_ver, cursor_pos);
+                if ((shape_changed || pos_changed) &&
+                    !send_cursor(client, send_mutex, cursor_pos,
+                                 shape_changed ? &shape : nullptr)) {
+                    break;
+                }
+            }
             auto tex = mailbox.pop_for(std::chrono::milliseconds(16));
             if (tex) {
                 last_tex = std::move(*tex);

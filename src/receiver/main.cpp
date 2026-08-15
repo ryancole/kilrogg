@@ -139,6 +139,29 @@ int run_h264(SOCKET s, const Hello& hello) {
             payload.resize(ph.size);
             if (!net::recv_all(s, payload.data(), payload.size())) break;
 
+            if (ph.flags & kPacketCursor) {
+                CursorUpdate cu;
+                if (payload.size() < sizeof(cu)) {
+                    KRG_LOG("short cursor packet, dropping connection");
+                    break;
+                }
+                std::memcpy(&cu, payload.data(), sizeof(cu));
+                size_t pixels = size_t{cu.width} * cu.height;
+                size_t expected = sizeof(cu) + (cu.has_shape ? pixels * 5 : 0);
+                if (payload.size() != expected ||
+                    (cu.has_shape && (pixels == 0 || cu.width > 1024 || cu.height > 1024))) {
+                    KRG_LOG("bogus cursor packet, dropping connection");
+                    break;
+                }
+                if (cu.has_shape) {
+                    presenter->set_cursor_shape(cu.width, cu.height, payload.data() + sizeof(cu),
+                                                payload.data() + sizeof(cu) + pixels * 4);
+                }
+                presenter->set_cursor_pos(cu.x, cu.y, cu.visible != 0);
+                frame_ready.push(true); // repaint even if no video frame arrives
+                continue;
+            }
+
             bool ok = decoder->decode(payload.data(), payload.size(),
                                       [&](ID3D11Texture2D* tex, UINT sub) {
                                           presenter->copy_video_frame(tex, sub);
