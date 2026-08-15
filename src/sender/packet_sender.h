@@ -39,10 +39,14 @@ public:
     PacketSender(const PacketSender&) = delete;
     PacketSender& operator=(const PacketSender&) = delete;
 
-    // Both copy their payload and return immediately.
-    void send_video(const uint8_t* data, size_t size, bool keyframe);
+    // All three copy their payload and return immediately.
+    void send_video(const uint8_t* data, size_t size, bool keyframe, int64_t capture_us,
+                    uint32_t encode_us);
     void send_cursor(std::span<const uint8_t> head, std::span<const uint8_t> bgra,
                      std::span<const uint8_t> invert);
+    // Answers the receiver's clock probe. Like cursor packets, never dropped:
+    // a pong lost to a backlog flush would just make the receiver ask again.
+    void send_pong(int64_t client_us, int64_t server_us);
 
     // Set once the socket has failed; the caller should drop the connection.
     bool dead() const { return dead_.load(std::memory_order_relaxed); }
@@ -70,10 +74,11 @@ private:
     void run();
     void push(std::vector<uint8_t> bytes, bool video, bool keyframe);
     // Header and payload land in one buffer so each packet is a single send();
-    // with TCP_NODELAY on, sending the 8-byte header separately would put a
-    // runt segment on the wire ahead of every frame.
-    static std::vector<uint8_t> build(uint32_t flags, std::span<const uint8_t> a,
-                                      std::span<const uint8_t> b, std::span<const uint8_t> c);
+    // with TCP_NODELAY on, sending the header separately would put a runt
+    // segment on the wire ahead of every frame.
+    static std::vector<uint8_t> build(uint32_t flags, int64_t capture_us, uint32_t encode_us,
+                                      std::span<const uint8_t> a, std::span<const uint8_t> b,
+                                      std::span<const uint8_t> c);
 
     SOCKET socket_;
     const size_t max_queued_bytes_;

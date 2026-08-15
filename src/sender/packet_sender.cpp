@@ -28,9 +28,11 @@ PacketSender::~PacketSender() {
     closesocket(socket_);
 }
 
-std::vector<uint8_t> PacketSender::build(uint32_t flags, std::span<const uint8_t> a,
-                                         std::span<const uint8_t> b, std::span<const uint8_t> c) {
-    VideoPacketHeader ph{static_cast<uint32_t>(a.size() + b.size() + c.size()), flags};
+std::vector<uint8_t> PacketSender::build(uint32_t flags, int64_t capture_us, uint32_t encode_us,
+                                         std::span<const uint8_t> a, std::span<const uint8_t> b,
+                                         std::span<const uint8_t> c) {
+    VideoPacketHeader ph{static_cast<uint32_t>(a.size() + b.size() + c.size()), flags, capture_us,
+                         encode_us};
     const auto* head = reinterpret_cast<const uint8_t*>(&ph);
 
     std::vector<uint8_t> out;
@@ -42,15 +44,24 @@ std::vector<uint8_t> PacketSender::build(uint32_t flags, std::span<const uint8_t
     return out;
 }
 
-void PacketSender::send_video(const uint8_t* data, size_t size, bool keyframe) {
+void PacketSender::send_video(const uint8_t* data, size_t size, bool keyframe, int64_t capture_us,
+                              uint32_t encode_us) {
     if (dead()) return;
-    push(build(keyframe ? kPacketKeyframe : 0, {data, size}, {}, {}), true, keyframe);
+    push(build(keyframe ? kPacketKeyframe : 0, capture_us, encode_us, {data, size}, {}, {}), true,
+         keyframe);
 }
 
 void PacketSender::send_cursor(std::span<const uint8_t> head, std::span<const uint8_t> bgra,
                                std::span<const uint8_t> invert) {
     if (dead()) return;
-    push(build(kPacketCursor, head, bgra, invert), false, false);
+    push(build(kPacketCursor, 0, 0, head, bgra, invert), false, false);
+}
+
+void PacketSender::send_pong(int64_t client_us, int64_t server_us) {
+    if (dead()) return;
+    Pong pong{client_us, server_us};
+    std::span body{reinterpret_cast<const uint8_t*>(&pong), sizeof(pong)};
+    push(build(kPacketPong, 0, 0, body, {}, {}), false, false);
 }
 
 void PacketSender::push(std::vector<uint8_t> bytes, bool video, bool keyframe) {

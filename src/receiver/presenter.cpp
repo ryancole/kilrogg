@@ -1,9 +1,12 @@
 #include "receiver/presenter.h"
 
 #include <algorithm>
+#include <cstring>
+#include <iterator>
 
 #include <d3dcompiler.h>
 
+#include "common/clock.h"
 #include "common/log.h"
 
 using Microsoft::WRL::ComPtr;
@@ -77,9 +80,20 @@ float4 ps_cursor(CursorVSOut i) : SV_Target {
 float4 ps_cursor_nv12(CursorVSOut i) : SV_Target {
     return float4(cursor_blend(nv12_to_rgb(i.uvf), i.uvc), 1);
 }
+
+// Stats overlay: a straight-alpha BGRA texture drawn over everything through
+// the blend state, reusing vs_cursor to place the quad.
+Texture2D overlayTex : register(t4);
+float4 ps_overlay(CursorVSOut i) : SV_Target { return overlayTex.Sample(smp, i.uvf); }
 )";
 
 constexpr char kWndClass[] = "KilroggWindow";
+
+// Overlay geometry: a margin inside the text box, the box's own opacity over
+// the video, and how far the box sits from the top-left corner of the window.
+constexpr LONG kOverlayPad = 6;
+constexpr int kOverlayBoxAlpha = 170;
+constexpr float kOverlayMargin = 12.0f;
 
 } // namespace
 
@@ -105,11 +119,23 @@ LRESULT CALLBACK Presenter::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 }
 
 std::unique_ptr<Presenter> Presenter::create(uint32_t frame_width, uint32_t frame_height,
-                                             bool video_mode) {
+                                             const Options& options) {
     std::unique_ptr<Presenter> p(new Presenter());
-    p->video_mode_ = video_mode;
+    p->video_mode_ = options.video_mode;
+    p->waitable_ = options.waitable;
+    p->stats_ = options.stats;
     if (!p->init(frame_width, frame_height)) return nullptr;
     return p;
+}
+
+Presenter::~Presenter() {
+    if (overlay_dc_) {
+        if (overlay_old_bmp_) SelectObject(overlay_dc_, overlay_old_bmp_);
+        DeleteDC(overlay_dc_);
+    }
+    if (overlay_bmp_) DeleteObject(overlay_bmp_);
+    if (overlay_font_) DeleteObject(overlay_font_);
+    if (frame_latency_waitable_) CloseHandle(frame_latency_waitable_);
 }
 
 bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
@@ -179,14 +205,21 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
     ComPtr<IDXGIFactory2> factory;
     adapter->GetParent(IID_PPV_ARGS(&factory));
 
-    ComPtr<IDXGIFactory5> factory5;
-    factory.As(&factory5);
-    if (factory5) {
-        BOOL allowed = FALSE;
-        if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                                                    &allowed, sizeof(allowed)))) {
-            tearing_ = allowed == TRUE;
+    // The two present modes want opposite things from the swapchain, so the
+    // flags are decided here and reused verbatim by ResizeBuffers.
+    if (!waitable_) {
+        ComPtr<IDXGIFactory5> factory5;
+        factory.As(&factory5);
+        if (factory5) {
+            BOOL allowed = FALSE;
+            if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                        &allowed, sizeof(allowed)))) {
+                tearing_ = allowed == TRUE;
+            }
         }
+        swap_flags_ = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    } else {
+        swap_flags_ = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     }
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
@@ -197,11 +230,25 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
     sd.Scaling = DXGI_SCALING_STRETCH;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    sd.Flags = swap_flags_;
     hr = factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &sd, nullptr, nullptr, &swap_);
     if (FAILED(hr)) {
         KRG_LOG("swapchain creation failed (hr=0x%08lX)", hr);
         return false;
+    }
+
+    if (waitable_) {
+        ComPtr<IDXGISwapChain2> swap2;
+        if (SUCCEEDED(swap_.As(&swap2))) {
+            // One frame of latency: the wait returns as the display finishes
+            // with a buffer, so rendering starts as late as it can and still
+            // make the next vblank.
+            swap2->SetMaximumFrameLatency(1);
+            frame_latency_waitable_ = swap2->GetFrameLatencyWaitableObject();
+        }
+        if (!frame_latency_waitable_) {
+            KRG_LOG("frame latency waitable object unavailable, pacing on Present alone");
+        }
     }
 
     ComPtr<ID3D11Texture2D> backbuffer;
@@ -287,18 +334,134 @@ bool Presenter::init(uint32_t frame_width, uint32_t frame_height) {
     samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     device_->CreateSamplerState(&samp, &sampler_);
 
+    if (stats_ && !init_overlay()) {
+        KRG_LOG("stats overlay unavailable, continuing without it");
+        stats_ = false;
+    }
+
     ShowWindow(hwnd_, SW_SHOW);
-    KRG_LOG("presenting %ux%u (tearing %s)", frame_w_, frame_h_,
-            tearing_ ? "allowed" : "unsupported");
+    KRG_LOG("presenting %ux%u (%s)", frame_w_, frame_h_,
+            waitable_ ? "waitable swapchain, 1 frame of latency"
+                      : (tearing_ ? "tearing allowed" : "tearing unsupported"));
     return true;
+}
+
+bool Presenter::init_overlay() {
+    ComPtr<ID3DBlob> blob;
+    ComPtr<ID3DBlob> errors;
+    if (FAILED(D3DCompile(kShaderSrc, sizeof(kShaderSrc) - 1, nullptr, nullptr, nullptr,
+                          "ps_overlay", "ps_5_0", 0, 0, &blob, &errors))) {
+        KRG_LOG("ps_overlay compile failed");
+        return false;
+    }
+    KRG_HRB(device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                                       &ps_overlay_));
+
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    KRG_HRB(device_->CreateBlendState(&bd, &overlay_blend_));
+
+    // Text drawn at 1:1 and sampled with a linear filter picks up a half-texel
+    // smear; point sampling keeps the glyphs as crisp as GDI rendered them.
+    D3D11_SAMPLER_DESC samp{};
+    samp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    samp.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    KRG_HRB(device_->CreateSamplerState(&samp, &point_sampler_));
+
+    // Sized for a dozen lines at whatever this monitor's DPI is; the quad only
+    // covers the sub-rect the text actually filled.
+    const UINT dpi = GetDpiForWindow(hwnd_);
+    const int font_height = MulDiv(15, static_cast<int>(dpi ? dpi : 96), 96);
+    overlay_tex_w_ = static_cast<uint32_t>(MulDiv(360, static_cast<int>(dpi ? dpi : 96), 96));
+    overlay_tex_h_ = static_cast<uint32_t>(font_height * 14);
+
+    overlay_dc_ = CreateCompatibleDC(nullptr);
+    if (!overlay_dc_) return false;
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = static_cast<LONG>(overlay_tex_w_);
+    bi.bmiHeader.biHeight = -static_cast<LONG>(overlay_tex_h_); // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    overlay_bmp_ = CreateDIBSection(overlay_dc_, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!overlay_bmp_ || !bits) return false;
+    overlay_bits_ = static_cast<uint8_t*>(bits);
+    overlay_old_bmp_ = SelectObject(overlay_dc_, overlay_bmp_);
+
+    overlay_font_ = CreateFontA(-font_height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    if (overlay_font_) SelectObject(overlay_dc_, overlay_font_);
+    SetTextColor(overlay_dc_, RGB(255, 255, 255));
+    SetBkMode(overlay_dc_, TRANSPARENT);
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = overlay_tex_w_;
+    td.Height = overlay_tex_h_;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    KRG_HRB(device_->CreateTexture2D(&td, nullptr, &overlay_tex_));
+    KRG_HRB(device_->CreateShaderResourceView(overlay_tex_.Get(), nullptr, &overlay_srv_));
+    return true;
+}
+
+void Presenter::set_stats_text(const char* text) {
+    if (!stats_ || !overlay_bits_) return;
+
+    const size_t stride = size_t{overlay_tex_w_} * 4;
+    std::memset(overlay_bits_, 0, stride * overlay_tex_h_);
+
+    RECT rc{kOverlayPad, kOverlayPad, static_cast<LONG>(overlay_tex_w_) - kOverlayPad,
+            static_cast<LONG>(overlay_tex_h_) - kOverlayPad};
+    const int len = static_cast<int>(std::strlen(text));
+    const UINT flags = DT_LEFT | DT_TOP | DT_NOPREFIX;
+    RECT measured = rc;
+    DrawTextA(overlay_dc_, text, len, &measured, flags | DT_CALCRECT);
+    DrawTextA(overlay_dc_, text, len, &rc, flags);
+    GdiFlush();
+
+    overlay_used_w_ = std::min<uint32_t>(overlay_tex_w_, measured.right + kOverlayPad);
+    overlay_used_h_ = std::min<uint32_t>(overlay_tex_h_, measured.bottom + kOverlayPad);
+
+    // GDI never writes the alpha channel, so derive it: the glyphs are white on
+    // a cleared bitmap, and everything inside the used rect gets at least the
+    // backing box's alpha so the text stays readable over bright content.
+    for (uint32_t y = 0; y < overlay_used_h_; ++y) {
+        uint8_t* row = overlay_bits_ + y * stride;
+        for (uint32_t x = 0; x < overlay_used_w_; ++x) {
+            uint8_t* px = row + size_t{x} * 4;
+            uint8_t coverage = std::max({px[0], px[1], px[2]});
+            px[3] = static_cast<uint8_t>(kOverlayBoxAlpha +
+                                         coverage * (255 - kOverlayBoxAlpha) / 255);
+        }
+    }
+
+    D3D11_BOX box{0, 0, 0, overlay_used_w_, overlay_used_h_, 1};
+    ctx_->UpdateSubresource(overlay_tex_.Get(), 0, &box, overlay_bits_,
+                            static_cast<UINT>(stride), 0);
 }
 
 void Presenter::handle_resize(uint32_t w, uint32_t h) {
     if (!swap_ || w == 0 || h == 0) return;
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
     rtv_.Reset();
-    HRESULT hr = swap_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN,
-                                      tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    HRESULT hr = swap_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, swap_flags_);
     if (FAILED(hr)) KRG_LOG("ResizeBuffers failed (hr=0x%08lX)", hr);
     // Recreate the RTV even if the resize failed: presenting at the old
     // backbuffer size (DXGI stretches) beats never presenting again.
@@ -373,6 +536,11 @@ void Presenter::copy_video_frame(ID3D11Texture2D* nv12, UINT subresource) {
 
 void Presenter::present() {
     if (!rtv_) return;
+    // Blocks until the display is done with a buffer. Doing it here rather
+    // than in the caller's loop keeps the wait next to the Present it paces,
+    // and the message pump runs either side of it.
+    if (frame_latency_waitable_) WaitForSingleObjectEx(frame_latency_waitable_, 100, TRUE);
+
     RECT rc{};
     GetClientRect(hwnd_, &rc);
 
@@ -426,13 +594,69 @@ void Presenter::present() {
         }
     }
 
-    // Sync interval 0 + allow-tearing: never block on vblank.
-    HRESULT hr = swap_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (stats_) draw_overlay(rc);
+
+    // Minimal mode: sync interval 0 + allow-tearing, never blocking on vblank.
+    // Smooth mode: sync interval 1, with the wait above providing the pacing.
+    HRESULT hr = waitable_ ? swap_->Present(1, 0)
+                           : swap_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    last_present_us_ = now_us();
     if (FAILED(hr) && !present_error_logged_) {
         KRG_LOG("Present failed (hr=0x%08lX)", hr);
         present_error_logged_ = true;
     }
+    if (stats_) {
+        UINT count = 0;
+        if (SUCCEEDED(swap_->GetLastPresentCount(&count))) {
+            present_log_[present_log_next_] = {count, last_present_us_};
+            present_log_next_ = (present_log_next_ + 1) % std::size(present_log_);
+        }
+    }
     drain_debug_messages();
+}
+
+void Presenter::draw_overlay(const RECT& client) {
+    if (!overlay_srv_ || !overlay_used_w_) return;
+    const float cw = static_cast<float>(client.right - client.left);
+    const float ch = static_cast<float>(client.bottom - client.top);
+    if (cw <= 0 || ch <= 0) return;
+
+    // Drawn at 1:1 with the backbuffer so the glyphs land on whole pixels,
+    // which means the box does not scale with the window the way the cursor
+    // does — deliberately, since it is instrumentation, not content.
+    const float x0 = kOverlayMargin, y0 = kOverlayMargin;
+    const float x1 = x0 + overlay_used_w_, y1 = y0 + overlay_used_h_;
+    const float u1 = static_cast<float>(overlay_used_w_) / overlay_tex_w_;
+    const float v1 = static_cast<float>(overlay_used_h_) / overlay_tex_h_;
+    float cb[8] = {x0 / cw * 2 - 1, 1 - y0 / ch * 2, x1 / cw * 2 - 1, 1 - y1 / ch * 2,
+                   0,               0,               u1,              v1};
+    ctx_->UpdateSubresource(cursor_cb_.Get(), 0, nullptr, cb, 0, 0);
+
+    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx_->VSSetShader(vs_cursor_.Get(), nullptr, 0);
+    ID3D11Buffer* cbs[] = {cursor_cb_.Get()};
+    ctx_->VSSetConstantBuffers(0, 1, cbs);
+    ctx_->PSSetShader(ps_overlay_.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* srvs[] = {overlay_srv_.Get()};
+    ctx_->PSSetShaderResources(4, 1, srvs);
+    ID3D11SamplerState* samplers[] = {point_sampler_.Get()};
+    ctx_->PSSetSamplers(0, 1, samplers);
+    ctx_->OMSetBlendState(overlay_blend_.Get(), nullptr, 0xFFFFFFFF);
+    ctx_->Draw(4, 0);
+    ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+}
+
+double Presenter::scanout_delay_ms() {
+    DXGI_FRAME_STATISTICS fs{};
+    if (FAILED(swap_->GetFrameStatistics(&fs)) || fs.SyncQPCTime.QuadPart == 0) {
+        return last_scanout_ms_;
+    }
+    for (const PresentRecord& record : present_log_) {
+        if (record.us == 0 || record.count != fs.PresentCount) continue;
+        last_scanout_ms_ = (qpc_to_us(fs.SyncQPCTime.QuadPart) - record.us) / 1000.0;
+        break;
+    }
+    return last_scanout_ms_;
 }
 
 void Presenter::drain_debug_messages() {

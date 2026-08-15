@@ -18,6 +18,11 @@ void set_low_latency(SOCKET s);
 // the connection rather than retrying.
 void set_send_timeout(SOCKET s, uint32_t seconds);
 
+// Fails a receive that produces nothing for `seconds`; 0 restores blocking.
+// Only sound where the peer is expected to speak on a schedule — the handshake
+// — since a partially read message leaves the stream unusable.
+void set_recv_timeout(SOCKET s, uint32_t seconds);
+
 // Probes an idle peer so a receiver that vanished without closing (power loss,
 // unplugged cable) surfaces as a socket error in seconds instead of after
 // TCP's multi-minute retransmission timeout. A static screen legitimately

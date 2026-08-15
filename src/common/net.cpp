@@ -24,6 +24,11 @@ void set_send_timeout(SOCKET s, uint32_t seconds) {
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
 }
 
+void set_recv_timeout(SOCKET s, uint32_t seconds) {
+    DWORD ms = seconds * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+}
+
 void enable_keepalive(SOCKET s, uint32_t idle_ms, uint32_t interval_ms) {
     tcp_keepalive ka{};
     ka.onoff = 1;
