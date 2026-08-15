@@ -39,6 +39,7 @@ struct Options {
     bool adapt = true;
     uint32_t codec = kCodecH264;
     uint32_t gop = 0; // 0 = as long as the encoder allows
+    uint32_t fps = 0; // 0 = whatever the display is actually refreshing at
 };
 
 void configure_client_socket(SOCKET s) {
@@ -225,6 +226,11 @@ constexpr auto kControlInterval = std::chrono::milliseconds(200);
 // this window are held rather than discarded — a receiver that cannot decode
 // still gets its keyframe, just not instantly.
 constexpr auto kMinKeyframeInterval = std::chrono::milliseconds(500);
+
+// The longest the run loop will sit waiting for a frame that may never come.
+// It bounds how late the control and stats intervals above can run on a static
+// screen; on a moving one the frame pacing expires long before it does.
+constexpr auto kQuietPoll = std::chrono::milliseconds(16);
 
 // The send queue's backlog budget: a quarter second of video at `bps`, which
 // rides out a Wi-Fi retransmit burst without letting lag build to where it is
@@ -423,6 +429,16 @@ int run_h264(const Options& opt, SOCKET listener) {
         // which case this connection is dropped a frame or two in and the
         // receiver reconnects against the right numbers.
         const uint32_t w = source_width(), h = source_height();
+        // The encoder budgets its bits per frame from the frame rate it is
+        // configured with, and nothing upstream limits how fast frames arrive:
+        // capture polls with a zero timeout, so a 165 Hz desktop produces 165
+        // frames a second. Told 60 and fed 165, the encoder spends most of
+        // three times the commanded bitrate and the only thing that would
+        // notice is a link slow enough to back up over it. So the rate is read
+        // from the display, and submissions below are paced to it.
+        const uint32_t fps =
+            opt.fps ? opt.fps : (capture_source ? capture_source->refresh_hz() : 60);
+        const auto frame_interval = std::chrono::microseconds(1'000'000 / fps);
 
         const uint32_t ceiling_bps = opt.bitrate_mbps * 1'000'000;
         // --no-adapt makes the rate the operator's decision rather than the
@@ -446,7 +462,7 @@ int run_h264(const Options& opt, SOCKET listener) {
         MfVideoEncoder::Config cfg;
         cfg.width = w;
         cfg.height = h;
-        cfg.fps = 60;
+        cfg.fps = fps;
         cfg.bitrate_bps = rate.target_bps();
         cfg.gop = opt.gop;
         cfg.codec = opt.codec;
@@ -505,7 +521,9 @@ int run_h264(const Options& opt, SOCKET listener) {
         // stops producing traffic and an encoder that honours low-latency mode
         // (depth 0) never pays for this at all.
         ComPtr<ID3D11Texture2D> last_tex;
+        bool tex_unsent = false;
         int flush_budget = 0;
+        auto next_submit = std::chrono::steady_clock::now();
         // Version 0 = "never sent to this client": the first poll always
         // delivers the current shape and position to a fresh connection.
         uint64_t cursor_pos_ver = 0, cursor_shape_ver = 0;
@@ -594,7 +612,17 @@ int run_h264(const Options& opt, SOCKET listener) {
                     queue_cursor(sender, cursor_pos, shape_changed ? &shape : nullptr);
                 }
             }
-            auto tex = mailbox.pop_for(std::chrono::milliseconds(16));
+            // Holding a frame that arrived early is what paces the encoder to
+            // the rate it was configured for: newer frames replace it in the
+            // mailbox while it waits, so what goes in at the slot is the
+            // latest one either way. With nothing in hand there is no slot to
+            // wait for, only the poll — which also keeps a static screen from
+            // spinning here once the flush budget is spent.
+            std::chrono::steady_clock::duration wait = kQuietPoll;
+            if (tex_unsent && next_submit > now) {
+                wait = std::min<std::chrono::steady_clock::duration>(kQuietPoll, next_submit - now);
+            }
+            auto tex = mailbox.pop_for(wait);
             if (tex) {
                 // Capture may have adopted a new display mode between the
                 // handshake and now; the flag that ends this connection is
@@ -608,10 +636,21 @@ int run_h264(const Options& opt, SOCKET listener) {
                 // it takes to get the frame we are about to hand it back out.
                 flush_budget = std::min(encoder->pipeline_depth(), kMaxFlushResubmits);
                 last_tex = std::move(*tex);
-            } else {
+                tex_unsent = true;
+            }
+
+            const auto at = std::chrono::steady_clock::now();
+            if (at < next_submit) continue; // this frame's slot has not come round
+            if (!tex_unsent) {
                 if (flush_budget <= 0 || !last_tex) continue;
                 --flush_budget;
             }
+            tex_unsent = false;
+            next_submit += frame_interval;
+            // Falling a whole frame behind — a stalled encoder, a capture that
+            // went away for a moment — is not a reason to then send a burst
+            // catching up on frames nobody will ever see.
+            if (next_submit < at) next_submit = at + frame_interval;
             if (!encoder->encode(last_tex.Get())) break;
         }
         // Nothing is going to consume frames until the next client arrives.
@@ -656,9 +695,12 @@ int run(int argc, char** argv) {
             opt.adapt = false;
         } else if (std::strcmp(argv[i], "--gop") == 0 && i + 1 < argc) {
             opt.gop = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+            opt.fps = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else {
             KRG_LOG("usage: kilrogg-send [--dummy] [--port N] [--codec h264|hevc|lz4] "
-                    "[--bitrate Mbps] [--min-bitrate Mbps] [--no-adapt] [--gop frames]");
+                    "[--bitrate Mbps] [--min-bitrate Mbps] [--no-adapt] [--gop frames] "
+                    "[--fps N]");
             return 2;
         }
     }
@@ -666,6 +708,10 @@ int run(int argc, char** argv) {
     // floor above the ceiling is a typo rather than a request.
     opt.bitrate_mbps = std::max(1u, opt.bitrate_mbps);
     opt.min_bitrate_mbps = std::clamp(opt.min_bitrate_mbps, 1u, opt.bitrate_mbps);
+    // 0 keeps the default, which is to ask the display. Anything else is taken
+    // as meant, within the range a display could plausibly be running at — the
+    // upper bound is there because this divides the second up.
+    if (opt.fps) opt.fps = std::clamp(opt.fps, 1u, 480u);
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1); // 1ms timer resolution: capture polling and frame

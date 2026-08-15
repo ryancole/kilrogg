@@ -43,6 +43,10 @@ public:
     Microsoft::WRL::ComPtr<ID3D11Device> device() const { return device_; }
     uint32_t width() const override { return width_.load(std::memory_order_acquire); }
     uint32_t height() const override { return height_.load(std::memory_order_acquire); }
+    // The display's refresh rate in whole Hz, i.e. the fastest rate frames can
+    // arrive at. The encoder budgets bits per frame from the rate it is told,
+    // so this is what it has to be told, and what submissions are paced to.
+    uint32_t refresh_hz() const { return refresh_hz_.load(std::memory_order_acquire); }
 
     // Drops the duplication so nothing is being captured or composited on our
     // behalf while no client is attached; the next frame request brings it
@@ -65,9 +69,10 @@ private:
     DxgiCapture() = default;
     bool init();
     bool reinit_duplication();
-    // Adopts a new display mode: publishes the dimensions and throws away the
-    // textures cut to the old ones, which are recreated lazily at the new size.
-    void adopt_mode(uint32_t new_width, uint32_t new_height);
+    // Adopts a new display mode: publishes the dimensions and refresh rate and
+    // throws away the textures cut to the old ones, which are recreated lazily
+    // at the new size.
+    void adopt_mode(uint32_t new_width, uint32_t new_height, uint32_t new_hz);
     void update_cursor(const DXGI_OUTDUPL_FRAME_INFO& info);
     void collect_rects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector<Rect>& rects);
     // Shared acquire logic; on success `acquired` holds the desktop texture
@@ -87,6 +92,7 @@ private:
     // Written by the capture thread on a mode change, read by the run loop
     // when it sets a connection's dimensions.
     std::atomic<uint32_t> width_{0}, height_{0};
+    std::atomic<uint32_t> refresh_hz_{60};
     std::atomic<bool> mode_changed_{false};
     uint32_t frame_id_ = 0;
     bool first_frame_ = true;

@@ -1,5 +1,6 @@
 #include "sender/dxgi_capture.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "common/log.h"
@@ -9,6 +10,31 @@ using Microsoft::WRL::ComPtr;
 namespace krg {
 
 namespace {
+
+// How fast the desktop is actually being redrawn, which is the rate the encoder
+// has to be told about: it budgets its bits per frame from the frame rate it is
+// configured with, so a 165 Hz desktop encoded as if it were 60 spends most of
+// three times the commanded bitrate.
+//
+// The duplication's own mode description is the first answer, rounded to whole
+// Hz — 143.998 and 144 are the same decision, and comparing exact rationals
+// would renegotiate the connection every time a driver reported it a hair
+// differently. Not every driver fills it in, hence the second opinion; 60 is
+// the answer that is wrong by the least if neither has one.
+uint32_t refresh_hz_from(const DXGI_MODE_DESC& mode) {
+    if (mode.RefreshRate.Numerator && mode.RefreshRate.Denominator) {
+        const uint32_t d = mode.RefreshRate.Denominator;
+        return std::max(1u, (mode.RefreshRate.Numerator + d / 2) / d);
+    }
+    DEVMODEA dm{};
+    dm.dmSize = sizeof(dm);
+    // 0 and 1 both mean "the hardware default" rather than a rate.
+    if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
+        return dm.dmDisplayFrequency;
+    }
+    return 60;
+}
+
 Rect rect_from(const RECT& r) {
     Rect out;
     out.x = static_cast<uint32_t>(r.left < 0 ? 0 : r.left);
@@ -97,8 +123,22 @@ std::unique_ptr<DxgiCapture> DxgiCapture::create() {
 
 bool DxgiCapture::init() {
     D3D_FEATURE_LEVEL fl{};
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+    // This device backs the encoder's DXGI device manager and the video
+    // processor doing BGRA->NV12, both of which are documented to require
+    // VIDEO_SUPPORT — it has worked without it on the drivers tried so far,
+    // which is not the same as being allowed to. BGRA_SUPPORT goes with it, and
+    // the dummy source's device already asks for both. A machine whose driver
+    // refuses them has no video path at all, but --codec lz4 still works, so
+    // that is a fallback rather than a failure.
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
                                    D3D11_SDK_VERSION, &device_, &fl, &context_);
+    if (FAILED(hr)) {
+        KRG_LOG("no video-capable D3D11 device (hr=0x%08lX), falling back — only --codec lz4 "
+                "will work", hr);
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                               D3D11_SDK_VERSION, &device_, &fl, &context_);
+    }
     if (FAILED(hr)) {
         KRG_LOG("D3D11CreateDevice failed (hr=0x%08lX)", hr);
         return false;
@@ -129,7 +169,7 @@ bool DxgiCapture::init() {
 
     if (!reinit_duplication()) return false;
 
-    KRG_LOG("capturing primary output at %ux%u", width(), height());
+    KRG_LOG("capturing primary output at %ux%u @%uHz", width(), height(), refresh_hz());
     return true;
 }
 
@@ -147,29 +187,35 @@ bool DxgiCapture::reinit_duplication() {
 
     DXGI_OUTDUPL_DESC desc{};
     dup_->GetDesc(&desc);
-    adopt_mode(desc.ModeDesc.Width, desc.ModeDesc.Height);
+    adopt_mode(desc.ModeDesc.Width, desc.ModeDesc.Height, refresh_hz_from(desc.ModeDesc));
 
     first_frame_ = true;
     return true;
 }
 
-void DxgiCapture::adopt_mode(uint32_t new_width, uint32_t new_height) {
+void DxgiCapture::adopt_mode(uint32_t new_width, uint32_t new_height, uint32_t new_hz) {
     const uint32_t old_w = width_.load(std::memory_order_relaxed);
     const uint32_t old_h = height_.load(std::memory_order_relaxed);
-    if (new_width == old_w && new_height == old_h) return;
+    const uint32_t old_hz = refresh_hz_.load(std::memory_order_relaxed);
+    if (new_width == old_w && new_height == old_h && new_hz == old_hz) return;
 
     // The pool and staging textures are cut to the old mode and the encoder on
     // the other side of the mailbox is configured for it, so both go. They are
     // recreated lazily at the new size on the next frame; the flag is what
     // tells the run loop to rebuild the encoder and the connection to match.
+    // A refresh rate change alone leaves the textures the right size, but the
+    // encoder is configured for the old rate just the same, so it renegotiates
+    // too — dropping a client for a fraction of a second beats encoding a
+    // 165 Hz desktop against a 60 fps bit budget.
     for (auto& tex : pool_) tex.Reset();
     staging_.Reset();
+    refresh_hz_.store(new_hz, std::memory_order_relaxed);
     height_.store(new_height, std::memory_order_relaxed);
     width_.store(new_width, std::memory_order_release);
 
     if (old_w != 0) {
-        KRG_LOG("display mode changed (%ux%u -> %ux%u), renegotiating with the client", old_w,
-                old_h, new_width, new_height);
+        KRG_LOG("display mode changed (%ux%u @%uHz -> %ux%u @%uHz), renegotiating with the client",
+                old_w, old_h, old_hz, new_width, new_height, new_hz);
         mode_changed_.store(true, std::memory_order_release);
     }
 }
