@@ -17,6 +17,7 @@
 #include "common/mailbox.h"
 #include "common/net.h"
 #include "common/protocol.h"
+#include "sender/control_receiver.h"
 #include "sender/dummy_source.h"
 #include "sender/dxgi_capture.h"
 #include "sender/mf_encoder.h"
@@ -32,6 +33,8 @@ struct Options {
     bool lz4 = false;
     uint16_t port = kDefaultPort;
     uint32_t bitrate_mbps = 40;
+    uint32_t codec = kCodecH264;
+    uint32_t gop = 0; // 0 = as long as the encoder allows
 };
 
 void configure_client_socket(SOCKET s) {
@@ -44,6 +47,25 @@ void configure_client_socket(SOCKET s) {
     // Keepalive covers the other half of the problem: an idle stream (static
     // screen) has nothing in flight for the retransmission timer to act on.
     net::enable_keepalive(s, 5000, 1000);
+}
+
+// The receiver speaks first, listing the codecs it can decode. A short timeout
+// keeps a port scan or a half-open connection from wedging the accept loop;
+// blocking is restored afterwards because the back-channel is legitimately
+// silent for minutes at a time.
+bool read_client_hello(SOCKET s, ClientHello& out) {
+    net::set_recv_timeout(s, 5);
+    bool ok = net::recv_all(s, &out, sizeof(out));
+    net::set_recv_timeout(s, 0);
+    if (!ok) {
+        KRG_LOG("no hello from client within 5s, dropping connection");
+        return false;
+    }
+    if (out.magic != kMagicClient) {
+        KRG_LOG("bad hello from client (magic 0x%08X), dropping connection", out.magic);
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +146,14 @@ int run_lz4(FrameSource& source, SOCKET listener) {
         SOCKET client = net::accept_client(listener);
         if (client == INVALID_SOCKET) continue;
         configure_client_socket(client);
+        ClientHello client_hello;
+        if (!read_client_hello(client, client_hello)) {
+            closesocket(client);
+            continue;
+        }
         KRG_LOG("client connected");
 
-        Hello hello{kMagic, w, h};
+        Hello hello{kMagic, w, h, kCodecNone};
         if (!net::send_all(client, &hello, sizeof(hello))) {
             closesocket(client);
             continue;
@@ -169,6 +196,11 @@ int run_lz4(FrameSource& source, SOCKET listener) {
 // ---------------------------------------------------------------------------
 // KRG2 path: hardware H.264. Frames stay on the GPU from capture to encoder.
 // ---------------------------------------------------------------------------
+
+// Ceiling on the quiet-tick re-submits described in the run loop. The depth it
+// clamps is a property of the encoder, not the content, so anything this large
+// means the reading is wrong and duplicate frames should stop rather than run.
+constexpr int kMaxFlushResubmits = 8;
 
 // Cursor packets are produced on the run loop's thread and video packets on
 // the encoder's event thread; the send queue serializes the two, so neither
@@ -216,10 +248,6 @@ int run_h264(const Options& opt, SOCKET listener) {
         h = capture_source->height();
     }
 
-    auto encoder =
-        MfH264Encoder::create(device, w, h, 60, opt.bitrate_mbps * 1'000'000);
-    if (!encoder) return 1;
-
     // Latest-wins with no merge: video frames are complete images, and stale
     // ones can simply vanish (drops happen before encoding, never after).
     Mailbox<ComPtr<ID3D11Texture2D>> mailbox;
@@ -262,13 +290,12 @@ int run_h264(const Options& opt, SOCKET listener) {
         SOCKET client = net::accept_client(listener);
         if (client == INVALID_SOCKET) continue;
         configure_client_socket(client);
-        KRG_LOG("client connected");
-
-        Hello hello{kMagicVideo, w, h};
-        if (!net::send_all(client, &hello, sizeof(hello))) {
+        ClientHello client_hello;
+        if (!read_client_hello(client, client_hello)) {
             closesocket(client);
             continue;
         }
+        KRG_LOG("client connected");
 
         // Budget the backlog in time rather than bytes: a quarter second of
         // video at the configured bitrate rides out a Wi-Fi retransmit burst
@@ -276,29 +303,64 @@ int run_h264(const Options& opt, SOCKET listener) {
         // queue larger than a single frame at absurdly low bitrates.
         PacketSender sender(client,
                             std::max<size_t>(512u << 10, size_t{opt.bitrate_mbps} * 1'000'000 / 32));
+
+        // Both ends have to agree, and either may be the one that cannot do
+        // HEVC — this machine's GPU or the receiver's decoder. Built fresh per
+        // connection so the choice (and the encoder's whole state) follows the
+        // client that is actually attached.
+        MfVideoEncoder::Config cfg;
+        cfg.width = w;
+        cfg.height = h;
+        cfg.fps = 60;
+        cfg.bitrate_bps = opt.bitrate_mbps * 1'000'000;
+        cfg.gop = opt.gop;
+        cfg.codec = opt.codec;
+        if (cfg.codec == kCodecHevc && !(client_hello.codecs & kCodecHevc)) {
+            KRG_LOG("receiver cannot decode HEVC, using H.264");
+            cfg.codec = kCodecH264;
+        }
+        auto encoder = MfVideoEncoder::create(device, cfg);
+        if (!encoder) return 1;
+        if (!(client_hello.codecs & encoder->codec())) {
+            KRG_LOG("receiver decodes none of the codecs this machine can encode, "
+                    "dropping connection");
+            continue;
+        }
+
+        Hello hello{kMagicVideo, w, h, encoder->codec()};
+        if (!net::send_all(client, &hello, sizeof(hello))) continue;
+
+        // Constructed after the PacketSender so it is torn down first, while
+        // the socket it reads from is still open.
+        ControlReceiver control(client, sender);
         auto stat_t0 = std::chrono::steady_clock::now();
 
-        encoder->set_sink([&sender](const uint8_t* data, size_t size, bool keyframe) {
-            sender.send_video(data, size, keyframe);
+        encoder->set_sink([&sender](const uint8_t* data, size_t size, bool keyframe,
+                                    int64_t capture_us, uint32_t encode_us) {
+            sender.send_video(data, size, keyframe, capture_us, encode_us);
         });
         encoder->request_keyframe();
 
-        // Async encoders hold a pipeline of frames and only emit frame N when
-        // frame N+1 arrives, so sparse content (a desktop with occasional
-        // changes) would sit in the encoder for seconds. On a quiet tick,
-        // re-submit the last frame to flush changes through — but only for a
-        // bounded burst, so a truly static screen stops producing traffic.
+        // Async encoders can hold a pipeline of frames, emitting frame N only
+        // once frame N+1 arrives; sparse content (a desktop with occasional
+        // changes) would then sit in the encoder indefinitely. On a quiet tick,
+        // re-submit the last frame to push the stuck ones out — but only as
+        // many times as the encoder is actually holding, so a static screen
+        // stops producing traffic and an encoder that honours low-latency mode
+        // (depth 0) never pays for this at all.
         ComPtr<ID3D11Texture2D> last_tex;
         int flush_budget = 0;
         // Version 0 = "never sent to this client": the first poll always
         // delivers the current shape and position to a fresh connection.
         uint64_t cursor_pos_ver = 0, cursor_shape_ver = 0;
         CursorPos cursor_pos;
-        while (!sender.dead()) {
-            // The queue threw away a backlog, so the receiver is sitting on a
-            // stream it can no longer decode; an IDR is the one packet that
-            // gets it back in sync.
-            if (sender.take_resync_request()) encoder->request_keyframe();
+        while (!sender.dead() && !control.closed()) {
+            // Two ways to end up needing an IDR: the send queue threw away a
+            // backlog, or the receiver failed to decode and said so. With a
+            // GOP this long, asking is the only way one ever arrives.
+            if (sender.take_resync_request() || control.take_keyframe_request()) {
+                encoder->request_keyframe();
+            }
 
             auto now = std::chrono::steady_clock::now();
             if (now - stat_t0 >= std::chrono::seconds(5)) {
@@ -330,8 +392,11 @@ int run_h264(const Options& opt, SOCKET listener) {
             }
             auto tex = mailbox.pop_for(std::chrono::milliseconds(16));
             if (tex) {
+                // Sampled before submitting: this is how many earlier frames
+                // the MFT is still sitting on, and therefore how many pushes
+                // it takes to get the frame we are about to hand it back out.
+                flush_budget = std::min(encoder->pipeline_depth(), kMaxFlushResubmits);
                 last_tex = std::move(*tex);
-                flush_budget = 30;
             } else {
                 if (flush_budget <= 0 || !last_tex) continue;
                 --flush_budget;
@@ -339,8 +404,7 @@ int run_h264(const Options& opt, SOCKET listener) {
             if (!encoder->encode(last_tex.Get())) break;
         }
         // Blocks until any in-flight sink call returns, so the encoder's event
-        // thread is done with `sender` before it goes out of scope below and
-        // closes the socket.
+        // thread is done with `sender` before either goes out of scope below.
         encoder->set_sink(nullptr);
         KRG_LOG("client disconnected");
     }
@@ -355,15 +419,21 @@ int run(int argc, char** argv) {
             opt.port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             ++i;
-            if (std::strcmp(argv[i], "lz4") == 0) opt.lz4 = true;
-            else if (std::strcmp(argv[i], "h264") != 0) {
-                KRG_LOG("unknown codec '%s' (h264|lz4)", argv[i]);
+            if (std::strcmp(argv[i], "lz4") == 0) {
+                opt.lz4 = true;
+            } else if (std::strcmp(argv[i], "hevc") == 0) {
+                opt.codec = kCodecHevc;
+            } else if (std::strcmp(argv[i], "h264") != 0) {
+                KRG_LOG("unknown codec '%s' (h264|hevc|lz4)", argv[i]);
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) {
             opt.bitrate_mbps = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--gop") == 0 && i + 1 < argc) {
+            opt.gop = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else {
-            KRG_LOG("usage: kilrogg-send [--dummy] [--port N] [--codec h264|lz4] [--bitrate Mbps]");
+            KRG_LOG("usage: kilrogg-send [--dummy] [--port N] [--codec h264|hevc|lz4] "
+                    "[--bitrate Mbps] [--gop frames]");
             return 2;
         }
     }
@@ -393,7 +463,8 @@ int run(int argc, char** argv) {
         return run_lz4(*source, listener);
     }
 
-    KRG_LOG("listening on port %u (h264, %u Mbit/s target)", opt.port, opt.bitrate_mbps);
+    KRG_LOG("listening on port %u (%s preferred, %u Mbit/s target)", opt.port,
+            opt.codec == kCodecHevc ? "hevc" : "h264", opt.bitrate_mbps);
     return run_h264(opt, listener);
 }
 
