@@ -47,6 +47,9 @@ public:
     void set_sink(Sink sink);
     bool encode(ID3D11Texture2D* bgra);
     void request_keyframe();
+    // Retargets the CBR rate mid-stream; see rate_control.h for who asks and
+    // why. False means the MFT refused, and the caller should stop trying.
+    bool set_bitrate(uint32_t bitrate_bps);
 
     uint32_t codec() const { return codec_; }
 
@@ -88,6 +91,7 @@ private:
     uint32_t gop_ = 0; // keyframe spacing actually in force; 0 = the MFT's own
 
     std::mutex mutex_; // guards transform_ calls, credits, pending input
+    bool bitrate_readback_checked_ = false; // guarded by mutex_
     int input_credits_ = 0;
     Microsoft::WRL::ComPtr<IMFSample> pending_;
 

@@ -22,6 +22,7 @@
 #include "sender/dxgi_capture.h"
 #include "sender/mf_encoder.h"
 #include "sender/packet_sender.h"
+#include "sender/rate_control.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -32,7 +33,9 @@ struct Options {
     bool dummy = false;
     bool lz4 = false;
     uint16_t port = kDefaultPort;
-    uint32_t bitrate_mbps = 40;
+    uint32_t bitrate_mbps = 40;     // ceiling, unless --no-adapt pins it
+    uint32_t min_bitrate_mbps = 3;  // how ugly the picture may get before giving up
+    bool adapt = true;
     uint32_t codec = kCodecH264;
     uint32_t gop = 0; // 0 = as long as the encoder allows
 };
@@ -202,6 +205,38 @@ int run_lz4(FrameSource& source, SOCKET listener) {
 // means the reading is wrong and duplicate frames should stop rather than run.
 constexpr int kMaxFlushResubmits = 8;
 
+// How often the rate controller looks at the send queue. Short enough that a
+// link going bad is answered within a few frames, long enough that the sample
+// is not one frame's worth of noise.
+constexpr auto kControlInterval = std::chrono::milliseconds(200);
+
+// Forcing IDRs back to back is how a struggling link stays struggling: an IDR
+// is the largest packet the encoder emits, so answering every overflow with one
+// immediately refills the queue that just overflowed. Requests arriving inside
+// this window are held rather than discarded — a receiver that cannot decode
+// still gets its keyframe, just not instantly.
+constexpr auto kMinKeyframeInterval = std::chrono::milliseconds(500);
+
+// The send queue's backlog budget: a quarter second of video at `bps`, which
+// rides out a Wi-Fi retransmit burst without letting lag build to where it is
+// felt. The floor keeps the queue larger than a single frame at absurdly low
+// bitrates.
+size_t queue_budget_bytes(uint32_t bps) {
+    return std::max<size_t>(512u << 10, size_t{bps} / 32);
+}
+
+// take_stats() resets its counters, so the control interval has to be the only
+// caller; the 5-second log line is assembled from these instead.
+void accumulate(PacketSender::Stats& acc, const PacketSender::Stats& st) {
+    acc.packets += st.packets;
+    acc.bytes += st.bytes;
+    acc.dropped_packets += st.dropped_packets;
+    acc.dropped_bytes += st.dropped_bytes;
+    acc.backlog_flushes += st.backlog_flushes;
+    acc.peak_queued_bytes = std::max(acc.peak_queued_bytes, st.peak_queued_bytes);
+    acc.queued_bytes = st.queued_bytes; // a depth, not a delta: latest wins
+}
+
 // Cursor packets are produced on the run loop's thread and video packets on
 // the encoder's event thread; the send queue serializes the two, so neither
 // needs a lock of its own.
@@ -297,12 +332,11 @@ int run_h264(const Options& opt, SOCKET listener) {
         }
         KRG_LOG("client connected");
 
-        // Budget the backlog in time rather than bytes: a quarter second of
-        // video at the configured bitrate rides out a Wi-Fi retransmit burst
-        // without letting lag build to where it is felt. The floor keeps the
-        // queue larger than a single frame at absurdly low bitrates.
-        PacketSender sender(client,
-                            std::max<size_t>(512u << 10, size_t{opt.bitrate_mbps} * 1'000'000 / 32));
+        // Budget the backlog in time rather than bytes; it is retuned from the
+        // control interval below whenever the encoder's rate changes.
+        const uint32_t ceiling_bps = opt.bitrate_mbps * 1'000'000;
+        size_t queue_capacity = queue_budget_bytes(ceiling_bps);
+        PacketSender sender(client, queue_capacity);
 
         // Both ends have to agree, and either may be the one that cannot do
         // HEVC — this machine's GPU or the receiver's decoder. Built fresh per
@@ -312,7 +346,7 @@ int run_h264(const Options& opt, SOCKET listener) {
         cfg.width = w;
         cfg.height = h;
         cfg.fps = 60;
-        cfg.bitrate_bps = opt.bitrate_mbps * 1'000'000;
+        cfg.bitrate_bps = ceiling_bps;
         cfg.gop = opt.gop;
         cfg.codec = opt.codec;
         if (cfg.codec == kCodecHevc && !(client_hello.codecs & kCodecHevc)) {
@@ -333,13 +367,22 @@ int run_h264(const Options& opt, SOCKET listener) {
         // Constructed after the PacketSender so it is torn down first, while
         // the socket it reads from is still open.
         ControlReceiver control(client, sender);
+
+        // Rebuilt per connection, so each client starts optimistic and learns
+        // its own link rather than inheriting the last one's verdict.
+        RateControl rate(ceiling_bps, opt.min_bitrate_mbps * 1'000'000);
+        bool rate_control_live = opt.adapt;
         auto stat_t0 = std::chrono::steady_clock::now();
+        auto ctl_t0 = stat_t0;
+        PacketSender::Stats stat_acc;
 
         encoder->set_sink([&sender](const uint8_t* data, size_t size, bool keyframe,
                                     int64_t capture_us, uint32_t encode_us) {
             sender.send_video(data, size, keyframe, capture_us, encode_us);
         });
         encoder->request_keyframe();
+        auto last_keyframe = std::chrono::steady_clock::now();
+        bool keyframe_pending = false;
 
         // Async encoders can hold a pipeline of frames, emitting frame N only
         // once frame N+1 arrives; sparse content (a desktop with occasional
@@ -355,31 +398,70 @@ int run_h264(const Options& opt, SOCKET listener) {
         uint64_t cursor_pos_ver = 0, cursor_shape_ver = 0;
         CursorPos cursor_pos;
         while (!sender.dead() && !control.closed()) {
+            auto now = std::chrono::steady_clock::now();
+
             // Two ways to end up needing an IDR: the send queue threw away a
             // backlog, or the receiver failed to decode and said so. With a
             // GOP this long, asking is the only way one ever arrives.
             if (sender.take_resync_request() || control.take_keyframe_request()) {
+                keyframe_pending = true;
+            }
+            if (keyframe_pending && now - last_keyframe >= kMinKeyframeInterval) {
                 encoder->request_keyframe();
+                keyframe_pending = false;
+                last_keyframe = now;
             }
 
-            auto now = std::chrono::steady_clock::now();
+            if (now - ctl_t0 >= kControlInterval) {
+                double secs = std::chrono::duration<double>(now - ctl_t0).count();
+                ctl_t0 = now;
+                // Counted at the socket, not at the encoder: under congestion
+                // this is the rate the receiver actually sees, which is exactly
+                // what the controller needs and what the 5-second line reports.
+                PacketSender::Stats st = sender.take_stats();
+                accumulate(stat_acc, st);
+
+                if (rate_control_live) {
+                    RateControl::Decision d = rate.update(
+                        {st.bytes, st.backlog_flushes, st.queued_bytes, queue_capacity, secs});
+                    // An encoder that refuses the change leaves the rate where
+                    // it is, so the queue keeps the budget that matches it and
+                    // the controller stops being consulted at all.
+                    if (d.bps && !encoder->set_bitrate(d.bps)) {
+                        rate_control_live = false;
+                    } else if (d.bps) {
+                        // The budget is a latency bound, so it follows the rate.
+                        queue_capacity = queue_budget_bytes(d.bps);
+                        sender.set_max_queued_bytes(queue_capacity);
+                        // Cuts are events worth seeing the moment they happen;
+                        // the climb back is a line a second, so it is left to
+                        // the 5-second line to report where it got to.
+                        if (d.congested) {
+                            KRG_LOG("link behind, dropping to %.1f Mbit/s (measured %.1f Mbit/s "
+                                    "on the wire)",
+                                    d.bps / 1e6, st.bytes * 8.0 / 1e6 / secs);
+                        }
+                    }
+                }
+            }
+
             if (now - stat_t0 >= std::chrono::seconds(5)) {
                 double secs = std::chrono::duration<double>(now - stat_t0).count();
                 stat_t0 = now;
-                // Counted at the socket, not at the encoder: under congestion
-                // this is the rate the receiver actually sees.
-                PacketSender::Stats st = sender.take_stats();
-                KRG_LOG("wire %.1f fps, %.2f Mbit/s; queue peak %zu KB, now %zu KB",
-                        st.packets / secs, st.bytes * 8.0 / 1e6 / secs,
+                const PacketSender::Stats& st = stat_acc;
+                KRG_LOG("wire %.1f fps, %.2f Mbit/s (target %.1f); queue peak %zu KB, now %zu KB",
+                        st.packets / secs, st.bytes * 8.0 / 1e6 / secs, rate.target_bps() / 1e6,
                         st.peak_queued_bytes >> 10, st.queued_bytes >> 10);
                 if (st.backlog_flushes) {
                     // The bottleneck is whichever of the two is slower: the
                     // link, or a receiver that cannot decode and present as
                     // fast as this machine encodes.
                     KRG_LOG("link or receiver behind: %llu backlog flushes, %llu packets "
-                            "(%.2f MB) dropped; try a lower --bitrate if this persists",
-                            st.backlog_flushes, st.dropped_packets, st.dropped_bytes / 1e6);
+                            "(%.2f MB) dropped%s",
+                            st.backlog_flushes, st.dropped_packets, st.dropped_bytes / 1e6,
+                            rate_control_live ? "" : "; try a lower --bitrate if this persists");
                 }
+                stat_acc = PacketSender::Stats{};
             }
 
             if (capture_source) {
@@ -429,14 +511,22 @@ int run(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) {
             opt.bitrate_mbps = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--min-bitrate") == 0 && i + 1 < argc) {
+            opt.min_bitrate_mbps = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--no-adapt") == 0) {
+            opt.adapt = false;
         } else if (std::strcmp(argv[i], "--gop") == 0 && i + 1 < argc) {
             opt.gop = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else {
             KRG_LOG("usage: kilrogg-send [--dummy] [--port N] [--codec h264|hevc|lz4] "
-                    "[--bitrate Mbps] [--gop frames]");
+                    "[--bitrate Mbps] [--min-bitrate Mbps] [--no-adapt] [--gop frames]");
             return 2;
         }
     }
+    // A zero ceiling would leave the controller nothing to work with, and a
+    // floor above the ceiling is a typo rather than a request.
+    opt.bitrate_mbps = std::max(1u, opt.bitrate_mbps);
+    opt.min_bitrate_mbps = std::clamp(opt.min_bitrate_mbps, 1u, opt.bitrate_mbps);
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1); // 1ms timer resolution: capture polling and frame
@@ -463,8 +553,14 @@ int run(int argc, char** argv) {
         return run_lz4(*source, listener);
     }
 
-    KRG_LOG("listening on port %u (%s preferred, %u Mbit/s target)", opt.port,
-            opt.codec == kCodecHevc ? "hevc" : "h264", opt.bitrate_mbps);
+    if (opt.adapt) {
+        KRG_LOG("listening on port %u (%s preferred, %u Mbit/s falling back to %u as the link "
+                "requires)", opt.port, opt.codec == kCodecHevc ? "hevc" : "h264",
+                opt.bitrate_mbps, opt.min_bitrate_mbps);
+    } else {
+        KRG_LOG("listening on port %u (%s preferred, %u Mbit/s fixed)", opt.port,
+                opt.codec == kCodecHevc ? "hevc" : "h264", opt.bitrate_mbps);
+    }
     return run_h264(opt, listener);
 }
 

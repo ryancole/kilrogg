@@ -6,6 +6,7 @@
 
 #include <codecapi.h>
 #include <mferror.h>
+#include <oleauto.h>
 
 #include <algorithm>
 #include <iterator>
@@ -403,14 +404,52 @@ int MfVideoEncoder::pipeline_depth() const {
     return submitted - emitted + queued;
 }
 
+// Both of the runtime knobs below are driven from the run loop while the event
+// thread is inside ProcessInput/ProcessOutput, so they take the same lock those
+// do rather than reaching into the MFT alongside them.
+
 void MfVideoEncoder::request_keyframe() {
     ComPtr<ICodecAPI> codec;
     if (SUCCEEDED(transform_.As(&codec))) {
         VARIANT v{};
         v.vt = VT_UI4;
         v.ulVal = 1;
+        std::lock_guard lock(mutex_);
         codec->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
     }
+}
+
+bool MfVideoEncoder::set_bitrate(uint32_t bitrate_bps) {
+    ComPtr<ICodecAPI> codec;
+    if (FAILED(transform_.As(&codec))) return false;
+
+    VARIANT v{};
+    v.vt = VT_UI4;
+    v.ulVal = bitrate_bps;
+    std::lock_guard lock(mutex_);
+    if (FAILED(codec->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v))) {
+        KRG_LOG("encoder: mean bitrate not settable mid-stream, rate stays at the initial target");
+        return false;
+    }
+
+    // configure_codec's warning applies here too: a vendor MFT can accept a
+    // setting after the output type is set and encode with its own anyway. A
+    // readback that disagrees proves the change was dropped; one that agrees
+    // proves nothing, which is why the 5-second stats line reports the wire
+    // rate next to the target rather than trusting this.
+    if (!bitrate_readback_checked_) {
+        bitrate_readback_checked_ = true;
+        VARIANT got{};
+        if (SUCCEEDED(codec->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &got))) {
+            if (got.vt != VT_UI4 || got.ulVal != bitrate_bps) {
+                KRG_LOG("encoder: bitrate change did not read back (asked %u, got %u) — this "
+                        "encoder may ignore rate control; --no-adapt pins the rate instead",
+                        bitrate_bps, got.vt == VT_UI4 ? got.ulVal : 0);
+            }
+            VariantClear(&got);
+        }
+    }
+    return true;
 }
 
 void MfVideoEncoder::set_sink(Sink sink) {

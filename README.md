@@ -30,6 +30,10 @@ are dropped *before* encoding, never after.
   constrained link, so instead one is emitted only when something asks: a fresh
   connection, a send-queue overflow, or the receiver reporting a decode failure
   over the back-channel. `--gop N` pins a fixed spacing if you want one.
+  Requests are honoured at most twice a second — an IDR is the largest packet
+  the encoder emits, so answering every overflow with one immediately refills
+  the queue that just overflowed. A request arriving inside that window is held
+  rather than dropped.
 - **Wire**: the receiver opens with a `ClientHello` listing the codecs it can
   decode, the sender replies with a `Hello` naming the one it picked, and the
   stream is then length-prefixed Annex B packets carrying the frame's capture
@@ -43,6 +47,23 @@ are dropped *before* encoding, never after.
   dropped one is undecodable anyway. Cursor packets are never dropped. The
   5-second stats line reports the wire rate and the queue high-water mark, so
   a link that cannot keep up says so explicitly.
+- **Adaptive bitrate** ([rate_control.cpp](src/sender/rate_control.cpp)):
+  `--bitrate` is a ceiling, not a fixed rate. Every 200 ms the sender looks at
+  what the send queue is doing and retunes the encoder — AIMD, cutting hard
+  and climbing back slowly, since guessing high costs a backlog flush, which
+  costs an IDR, which is the most expensive thing that can go on the wire. It
+  backs off on an overflow, or on a queue that stays half full across
+  consecutive samples, down to `--min-bitrate` (3 Mbit/s by default); after
+  five clean samples in a row it steps back up by a sixteenth of the ceiling.
+  A cut aims just under what the wire was measured to carry rather than
+  stepping down blindly — while the queue is backed up the send thread never
+  idles, so that figure is the link and not the encoder. Depth is read as it
+  *stands* rather than as it peaked, and no reading cuts the rate while the
+  wire is carrying everything it was asked for: the encoder hands a frame over
+  in one burst, and a queue caught mid-drain is not a slow link. On loopback
+  that distinction is the difference between holding 40 Mbit/s and sawing away
+  at it over megabyte peaks that drain instantly. `--no-adapt` pins the rate
+  for A/B comparisons.
 - **Decode/Present**: hardware decode (DXVA) on the presenter's own D3D11
   device ([mf_decoder.cpp](src/receiver/mf_decoder.cpp)); NV12 is converted to
   RGB in the pixel shader and drawn through a flip-model swapchain with sync
@@ -104,7 +125,9 @@ build\Release\kilrogg-recv.exe <host-ip>
 Esc or closing the window quits the receiver; the sender keeps listening for
 the next connection.
 
-Sender flags: `--bitrate N` (Mbit/s, default 40), `--codec h264|hevc|lz4`,
+Sender flags: `--bitrate N` (Mbit/s, default 40 — a ceiling, not a fixed rate),
+`--min-bitrate N` (how far the link is allowed to push it down, default 3),
+`--no-adapt` to pin the rate at `--bitrate` instead, `--codec h264|hevc|lz4`,
 `--gop N` (frames between keyframes; the default is "only when asked"),
 `--port N`, and `--dummy`, which streams a synthetic bouncing square instead of
 the desktop — useful for testing the pipeline without capture, including over
@@ -122,10 +145,16 @@ asking for — on the same content HEVC used a third of H.264's bitrate here.
 - Primary monitor only; no monitor selection.
 - Display resolution changes mid-stream exit the sender rather than
   renegotiating.
-- No adaptive bitrate: the sender encodes at `--bitrate` no matter what the
-  link can carry. Overflow is handled (video is dropped and an IDR forced,
-  and the stats line says so) but not avoided — lowering `--bitrate` is the
-  fix.
+- Rate control reacts rather than predicts: it learns a link is too slow by
+  filling the queue on it, so the first second or so of a link going bad still
+  costs dropped video and a resync. It also relearns from scratch on every
+  reconnect, starting each new client at `--bitrate`.
+- Rate control assumes the encoder honours a mid-stream
+  `AVEncCommonMeanBitRate`. NVENC does (measured: commanded 4 Mbit/s settles at
+  ~6 on the wire, commanded 40 settles at ~41, no IDR needed). An encoder that
+  accepts the setting and quietly ignores it would leave the rate pinned; a
+  readback mismatch is logged, but a vendor MFT that lies about both is not
+  something the sender can detect. `--no-adapt` is the fallback.
 - Requires a hardware H.264 encoder (any non-ancient GPU) and decoder.
 - The two clocks are synchronised only well enough to attribute latency; the
   `network` and `capture to present` figures inherit the ping/pong estimate's
