@@ -45,6 +45,7 @@ add_executable(kilrogg-send
   src/sender/dxgi_capture.cpp
   src/sender/mf_encoder.cpp
   src/sender/packet_sender.cpp
+  src/sender/rate_control.cpp
   src/sender/kilrogg-send.rc
 )
 target_include_directories(kilrogg-send PRIVATE ${lz4_SOURCE_DIR}/lib)

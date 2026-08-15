@@ -137,6 +137,11 @@ void PacketSender::run() {
     }
 }
 
+void PacketSender::set_max_queued_bytes(size_t bytes) {
+    std::lock_guard lock(mutex_);
+    max_queued_bytes_ = bytes;
+}
+
 bool PacketSender::take_resync_request() {
     std::lock_guard lock(mutex_);
     bool requested = resync_requested_;

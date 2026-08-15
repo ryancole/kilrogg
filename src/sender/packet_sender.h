@@ -51,6 +51,13 @@ public:
     // Set once the socket has failed; the caller should drop the connection.
     bool dead() const { return dead_.load(std::memory_order_relaxed); }
 
+    // The budget is a wall-clock tolerance expressed in bytes, so it has to
+    // track the encoder's rate: left at the value for 40 Mbit/s, a queue full
+    // of 5 Mbit/s video is two seconds of latency rather than a quarter of
+    // one. Shrinking it does not flush what is already queued — the next
+    // packet that does not fit triggers the usual overflow path.
+    void set_max_queued_bytes(size_t bytes);
+
     // True once per backlog flush, and cleared by the read: the caller must
     // ask the encoder for a keyframe so the receiver can resync.
     bool take_resync_request();
@@ -81,9 +88,9 @@ private:
                                       std::span<const uint8_t> c);
 
     SOCKET socket_;
-    const size_t max_queued_bytes_;
 
     std::mutex mutex_;
+    size_t max_queued_bytes_;
     std::condition_variable cv_;
     std::deque<Packet> queue_;
     size_t queued_bytes_ = 0;
