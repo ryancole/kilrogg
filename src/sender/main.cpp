@@ -2,11 +2,11 @@
 
 #include <timeapi.h>
 
-#include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
-#include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,6 +20,7 @@
 #include "sender/dummy_source.h"
 #include "sender/dxgi_capture.h"
 #include "sender/mf_encoder.h"
+#include "sender/packet_sender.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -32,6 +33,18 @@ struct Options {
     uint16_t port = kDefaultPort;
     uint32_t bitrate_mbps = 40;
 };
+
+void configure_client_socket(SOCKET s) {
+    net::set_low_latency(s);
+    // A receiver that has not accepted a single byte for this long is wedged
+    // or gone; either way the viewer is staring at a frame seconds old, so
+    // dropping the connection and listening again beats blocking in send()
+    // until TCP's multi-minute retransmission timeout expires.
+    net::set_send_timeout(s, 5);
+    // Keepalive covers the other half of the problem: an idle stream (static
+    // screen) has nothing in flight for the retransmission timer to act on.
+    net::enable_keepalive(s, 5000, 1000);
+}
 
 // ---------------------------------------------------------------------------
 // Legacy KRG1 path: dirty rects + LZ4. Lossless; kept as a debug reference
@@ -110,7 +123,7 @@ int run_lz4(FrameSource& source, SOCKET listener) {
     for (;;) {
         SOCKET client = net::accept_client(listener);
         if (client == INVALID_SOCKET) continue;
-        net::set_low_latency(client);
+        configure_client_socket(client);
         KRG_LOG("client connected");
 
         Hello hello{kMagic, w, h};
@@ -157,30 +170,25 @@ int run_lz4(FrameSource& source, SOCKET listener) {
 // KRG2 path: hardware H.264. Frames stay on the GPU from capture to encoder.
 // ---------------------------------------------------------------------------
 
-// Cursor packets go out on the run loop's thread while video packets go out
-// on the encoder's event thread — `send_mutex` keeps the two packet streams
-// from interleaving mid-packet.
-bool send_cursor(SOCKET s, std::mutex& send_mutex, const CursorPos& pos,
-                 const CursorShape* shape) {
+// Cursor packets are produced on the run loop's thread and video packets on
+// the encoder's event thread; the send queue serializes the two, so neither
+// needs a lock of its own.
+void queue_cursor(PacketSender& sender, const CursorPos& pos, const CursorShape* shape) {
     CursorUpdate cu{};
     cu.x = pos.x;
     cu.y = pos.y;
     cu.visible = pos.visible ? 1 : 0;
-    size_t extra = 0;
     if (shape) {
         cu.has_shape = 1;
         cu.width = shape->width;
         cu.height = shape->height;
-        extra = shape->bgra.size() + shape->invert.size();
     }
-    VideoPacketHeader ph{static_cast<uint32_t>(sizeof(cu) + extra), kPacketCursor};
-    std::lock_guard lock(send_mutex);
-    if (!net::send_all(s, &ph, sizeof(ph)) || !net::send_all(s, &cu, sizeof(cu))) return false;
+    std::span head{reinterpret_cast<const uint8_t*>(&cu), sizeof(cu)};
     if (shape) {
-        if (!net::send_all(s, shape->bgra.data(), shape->bgra.size())) return false;
-        if (!net::send_all(s, shape->invert.data(), shape->invert.size())) return false;
+        sender.send_cursor(head, shape->bgra, shape->invert);
+    } else {
+        sender.send_cursor(head, {}, {});
     }
-    return true;
 }
 
 int run_h264(const Options& opt, SOCKET listener) {
@@ -253,7 +261,7 @@ int run_h264(const Options& opt, SOCKET listener) {
     for (;;) {
         SOCKET client = net::accept_client(listener);
         if (client == INVALID_SOCKET) continue;
-        net::set_low_latency(client);
+        configure_client_socket(client);
         KRG_LOG("client connected");
 
         Hello hello{kMagicVideo, w, h};
@@ -262,30 +270,16 @@ int run_h264(const Options& opt, SOCKET listener) {
             continue;
         }
 
-        std::atomic<bool> dead{false};
-        std::mutex send_mutex;
+        // Budget the backlog in time rather than bytes: a quarter second of
+        // video at the configured bitrate rides out a Wi-Fi retransmit burst
+        // without letting lag build to where it is felt. The floor keeps the
+        // queue larger than a single frame at absurdly low bitrates.
+        PacketSender sender(client,
+                            std::max<size_t>(512u << 10, size_t{opt.bitrate_mbps} * 1'000'000 / 32));
         auto stat_t0 = std::chrono::steady_clock::now();
-        uint32_t stat_frames = 0;
-        int64_t stat_bytes = 0;
 
-        encoder->set_sink([&](const uint8_t* data, size_t size, bool keyframe) {
-            VideoPacketHeader ph{static_cast<uint32_t>(size), keyframe ? kPacketKeyframe : 0};
-            std::lock_guard lock(send_mutex);
-            if (!net::send_all(client, &ph, sizeof(ph)) || !net::send_all(client, data, size)) {
-                dead = true;
-                return;
-            }
-            ++stat_frames;
-            stat_bytes += sizeof(ph) + size;
-            auto now = std::chrono::steady_clock::now();
-            if (now - stat_t0 >= std::chrono::seconds(5)) {
-                double secs = std::chrono::duration<double>(now - stat_t0).count();
-                KRG_LOG("%.1f fps, %.2f Mbit/s", stat_frames / secs,
-                        stat_bytes * 8.0 / 1e6 / secs);
-                stat_frames = 0;
-                stat_bytes = 0;
-                stat_t0 = now;
-            }
+        encoder->set_sink([&sender](const uint8_t* data, size_t size, bool keyframe) {
+            sender.send_video(data, size, keyframe);
         });
         encoder->request_keyframe();
 
@@ -300,15 +294,38 @@ int run_h264(const Options& opt, SOCKET listener) {
         // delivers the current shape and position to a fresh connection.
         uint64_t cursor_pos_ver = 0, cursor_shape_ver = 0;
         CursorPos cursor_pos;
-        while (!dead) {
+        while (!sender.dead()) {
+            // The queue threw away a backlog, so the receiver is sitting on a
+            // stream it can no longer decode; an IDR is the one packet that
+            // gets it back in sync.
+            if (sender.take_resync_request()) encoder->request_keyframe();
+
+            auto now = std::chrono::steady_clock::now();
+            if (now - stat_t0 >= std::chrono::seconds(5)) {
+                double secs = std::chrono::duration<double>(now - stat_t0).count();
+                stat_t0 = now;
+                // Counted at the socket, not at the encoder: under congestion
+                // this is the rate the receiver actually sees.
+                PacketSender::Stats st = sender.take_stats();
+                KRG_LOG("wire %.1f fps, %.2f Mbit/s; queue peak %zu KB, now %zu KB",
+                        st.packets / secs, st.bytes * 8.0 / 1e6 / secs,
+                        st.peak_queued_bytes >> 10, st.queued_bytes >> 10);
+                if (st.backlog_flushes) {
+                    // The bottleneck is whichever of the two is slower: the
+                    // link, or a receiver that cannot decode and present as
+                    // fast as this machine encodes.
+                    KRG_LOG("link or receiver behind: %llu backlog flushes, %llu packets "
+                            "(%.2f MB) dropped; try a lower --bitrate if this persists",
+                            st.backlog_flushes, st.dropped_packets, st.dropped_bytes / 1e6);
+                }
+            }
+
             if (capture_source) {
                 CursorShape shape;
                 bool shape_changed = capture_source->poll_cursor_shape(cursor_shape_ver, shape);
                 bool pos_changed = capture_source->poll_cursor_pos(cursor_pos_ver, cursor_pos);
-                if ((shape_changed || pos_changed) &&
-                    !send_cursor(client, send_mutex, cursor_pos,
-                                 shape_changed ? &shape : nullptr)) {
-                    break;
+                if (shape_changed || pos_changed) {
+                    queue_cursor(sender, cursor_pos, shape_changed ? &shape : nullptr);
                 }
             }
             auto tex = mailbox.pop_for(std::chrono::milliseconds(16));
@@ -321,8 +338,10 @@ int run_h264(const Options& opt, SOCKET listener) {
             }
             if (!encoder->encode(last_tex.Get())) break;
         }
+        // Blocks until any in-flight sink call returns, so the encoder's event
+        // thread is done with `sender` before it goes out of scope below and
+        // closes the socket.
         encoder->set_sink(nullptr);
-        closesocket(client);
         KRG_LOG("client disconnected");
     }
 }
