@@ -213,7 +213,11 @@ Sender flags: `--bitrate N` (Mbit/s, default 40 — a ceiling, not a fixed rate)
 `--fps N` (default: the display's refresh rate), `--port N`,
 `--display N|name` (default: the primary; the name is matched case-
 insensitively against any part of `Dell AW3423DW (\\.\DISPLAY1) on NVIDIA
-GeForce RTX 4090`), `--list-displays` to print that list and exit, and
+GeForce RTX 4090`), `--list-displays` to print that list and exit, `--list-encoders` to print every
+hardware encoder this machine has, the GPU each belongs to and whether it will
+actually start right now (the same activation that fails at connection time,
+without needing a client — so it can be taken with and without whatever is
+suspected of holding the card's encoder sessions), and
 `--dummy`, which streams a synthetic bouncing square instead of the desktop —
 useful for testing the pipeline without capture, including over loopback.
 
@@ -227,6 +231,24 @@ waitable-swapchain present mode.
 `--codec hevc` is a request, not a demand: the receiver advertises what it can
 decode and the sender falls back to H.264 if either end lacks HEVC. It is worth
 asking for — on the same content HEVC used a third of H.264's bitrate here.
+
+With no `--codec` at all, the sender may reach for HEVC on its own, for frame
+rate rather than for bitrate. H.264's levels are a macroblock-per-second budget
+and the encoders built into GPUs stop at level 5.2, so a large display at a
+high refresh rate can ask for a level nobody offers; the encoder's entire reply
+is a refused media type, and the sender answers by walking the frame rate down.
+2560×1600 at 240 Hz settles on 129 fps, which is felt as judder on a 240 Hz
+panel. HEVC budgets luma samples instead and has room to spare. So when H.264
+lands short of the display's rate and the receiver can decode HEVC, the sender
+builds the encoder again as HEVC and keeps it if it bought frames.
+
+This reacts to what the encoder settled on rather than predicting it from the
+spec, because the spec is not what the hardware does: NVENC took 3440×1440 at
+480 fps here, against the 107 level 5.2 nominally allows, so anything computed
+up front would switch codecs on machines that never needed it. The second
+attempt is therefore paid for only on the connections that were going to judder
+anyway, and an explicit `--codec` is left alone — that is an instruction, not a
+preference.
 
 ## Current limitations / roadmap
 
