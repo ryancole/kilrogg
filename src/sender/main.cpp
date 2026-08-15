@@ -440,9 +440,11 @@ int run_h264(const Options& opt, SOCKET listener) {
         // three times the commanded bitrate and the only thing that would
         // notice is a link slow enough to back up over it. So the rate is read
         // from the display, and submissions below are paced to it.
-        const uint32_t fps =
+        // The encoder may not take this rate — H.264's levels run out somewhere
+        // above 129 fps at 2560x1600 — so it is a request, and what the encoder
+        // settled on is read back below.
+        const uint32_t display_fps =
             opt.fps ? opt.fps : (capture_source ? capture_source->refresh_hz() : 60);
-        const auto frame_interval = std::chrono::microseconds(1'000'000 / fps);
 
         const uint32_t ceiling_bps = opt.bitrate_mbps * 1'000'000;
         // --no-adapt makes the rate the operator's decision rather than the
@@ -466,7 +468,7 @@ int run_h264(const Options& opt, SOCKET listener) {
         MfVideoEncoder::Config cfg;
         cfg.width = w;
         cfg.height = h;
-        cfg.fps = fps;
+        cfg.fps = display_fps;
         cfg.bitrate_bps = rate.target_bps();
         cfg.gop = opt.gop;
         cfg.codec = opt.codec;
@@ -489,6 +491,13 @@ int run_h264(const Options& opt, SOCKET listener) {
                     "dropping connection");
             continue;
         }
+
+        // Pacing, the bit budget and the stats all run on the rate frames are
+        // actually submitted at, which is the encoder's answer rather than the
+        // display's — commanding a 240 Hz budget into an encoder configured for
+        // 129 would overspend the link by the ratio between them.
+        const uint32_t fps = encoder->fps();
+        const auto frame_interval = std::chrono::microseconds(1'000'000 / fps);
 
         Hello hello{kMagicVideo, w, h, encoder->codec()};
         if (!net::send_all(client, &hello, sizeof(hello))) continue;
