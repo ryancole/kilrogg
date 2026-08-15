@@ -429,6 +429,10 @@ int run_h264(const Options& opt, SOCKET listener) {
         // which case this connection is dropped a frame or two in and the
         // receiver reconnects against the right numbers.
         const uint32_t w = source_width(), h = source_height();
+        // Part of the mode just as much as the dimensions are, and settled here
+        // for the same reason: the encoder's conversion is built around it.
+        const DXGI_FORMAT format =
+            capture_source ? capture_source->format() : DXGI_FORMAT_B8G8R8A8_UNORM;
         // The encoder budgets its bits per frame from the frame rate it is
         // configured with, and nothing upstream limits how fast frames arrive:
         // capture polls with a zero timeout, so a 165 Hz desktop produces 165
@@ -466,6 +470,7 @@ int run_h264(const Options& opt, SOCKET listener) {
         cfg.bitrate_bps = rate.target_bps();
         cfg.gop = opt.gop;
         cfg.codec = opt.codec;
+        cfg.input_format = format;
         if (cfg.codec == kCodecHevc && !(client_hello.codecs & kCodecHevc)) {
             KRG_LOG("receiver cannot decode HEVC, using H.264");
             cfg.codec = kCodecH264;
@@ -504,6 +509,14 @@ int run_h264(const Options& opt, SOCKET listener) {
         auto stat_t0 = std::chrono::steady_clock::now();
         auto ctl_t0 = stat_t0;
         PacketSender::Stats stat_acc;
+
+        // The encoder divides the rate it is given by the frame rate it was
+        // configured with; `budget` works out what to give it so that what
+        // comes out is the rate the link was asked for. `submitted` is the
+        // measurement it runs on, counted where frames actually go in.
+        FrameBudget budget(fps);
+        uint32_t commanded_bps = rate.target_bps(); // what the encoder was built with
+        uint32_t submitted = 0;
 
         encoder->set_sink([&sender](const uint8_t* data, size_t size, bool keyframe,
                                     int64_t capture_us, uint32_t encode_us) {
@@ -564,13 +577,10 @@ int run_h264(const Options& opt, SOCKET listener) {
                 if (rate_control_live) {
                     RateControl::Decision d = rate.update(
                         {st.bytes, st.backlog_flushes, st.queued_bytes, queue_capacity, secs});
-                    // An encoder that refuses the change leaves the rate where
-                    // it is, so the queue keeps the budget that matches it and
-                    // the controller stops being consulted at all.
-                    if (d.bps && !encoder->set_bitrate(d.bps)) {
-                        rate_control_live = false;
-                    } else if (d.bps) {
-                        // The budget is a latency bound, so it follows the rate.
+                    if (d.bps) {
+                        // The budget is a latency bound, so it follows the wire
+                        // rate — which is the target, not the command below:
+                        // the correction buys frames, not bandwidth.
                         queue_capacity = queue_budget_bytes(d.bps);
                         sender.set_max_queued_bytes(queue_capacity);
                         // Cuts are events worth seeing the moment they happen;
@@ -582,7 +592,21 @@ int run_h264(const Options& opt, SOCKET listener) {
                                     d.bps / 1e6, st.bytes * 8.0 / 1e6 / secs);
                         }
                     }
+                    // What the encoder has to be told to actually put the
+                    // target on the wire, given how many frames it was fed.
+                    const uint32_t want = budget.command(rate.target_bps(), submitted, secs);
+                    // An encoder that refuses the change leaves the rate where
+                    // it is, so the queue keeps the budget that matches it and
+                    // the controller stops being consulted at all.
+                    if (want != commanded_bps) {
+                        if (encoder->set_bitrate(want)) {
+                            commanded_bps = want;
+                        } else {
+                            rate_control_live = false;
+                        }
+                    }
                 }
+                submitted = 0;
             }
 
             if (now - stat_t0 >= std::chrono::seconds(5)) {
@@ -592,6 +616,15 @@ int run_h264(const Options& opt, SOCKET listener) {
                 KRG_LOG("wire %.1f fps, %.2f Mbit/s (target %.1f); queue peak %zu KB, now %zu KB",
                         st.packets / secs, st.bytes * 8.0 / 1e6 / secs, rate.target_bps() / 1e6,
                         st.peak_queued_bytes >> 10, st.queued_bytes >> 10);
+                // Only worth a line while it is doing something: a multiplier
+                // of 1 means content is keeping up with the display, which is
+                // the case this correction does not apply to.
+                if (budget.multiplier() > 1.01) {
+                    KRG_LOG("content is running at %.0f%% of %u Hz, so the encoder is commanded "
+                            "%.1f Mbit/s to spend %.1f on the wire",
+                            100.0 / budget.multiplier(), fps, commanded_bps / 1e6,
+                            rate.target_bps() / 1e6);
+                }
                 if (st.backlog_flushes) {
                     // The bottleneck is whichever of the two is slower: the
                     // link, or a receiver that cannot decode and present as
@@ -627,10 +660,12 @@ int run_h264(const Options& opt, SOCKET listener) {
                 // Capture may have adopted a new display mode between the
                 // handshake and now; the flag that ends this connection is
                 // checked once per iteration, so a frame cut to the new mode
-                // can arrive first. The encoder is built for the old one.
+                // can arrive first. The encoder is built for the old one —
+                // including its pixel format, which changes on its own when
+                // HDR is switched on or off without the size moving at all.
                 D3D11_TEXTURE2D_DESC td{};
                 (*tex)->GetDesc(&td);
-                if (td.Width != w || td.Height != h) continue;
+                if (td.Width != w || td.Height != h || td.Format != format) continue;
                 // Sampled before submitting: this is how many earlier frames
                 // the MFT is still sitting on, and therefore how many pushes
                 // it takes to get the frame we are about to hand it back out.
@@ -652,6 +687,7 @@ int run_h264(const Options& opt, SOCKET listener) {
             // catching up on frames nobody will ever see.
             if (next_submit < at) next_submit = at + frame_interval;
             if (!encoder->encode(last_tex.Get())) break;
+            ++submitted;
         }
         // Nothing is going to consume frames until the next client arrives.
         capture_gate.set(false);

@@ -1,6 +1,7 @@
 #include "sender/rate_control.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace krg {
 namespace {
@@ -102,6 +103,36 @@ RateControl::Decision RateControl::update(const Sample& s) {
     if (target_bps_ >= ceiling_bps_) return {};
     target_bps_ = std::min(ceiling_bps_, target_bps_ + step_bps_);
     return {target_bps_, false};
+}
+
+uint32_t FrameBudget::command(uint32_t target_bps, uint32_t frames, double secs) {
+    if (secs > 0 && configured_fps_) {
+        const double submitted_fps = frames / secs;
+        const double share = submitted_fps / configured_fps_;
+        // Content keeping up means the encoder's own budget is right and there
+        // is nothing to correct. Below the floor the screen is effectively
+        // still, and the last multiplier is held rather than recomputed: there
+        // is nothing to spend a larger budget on either way, and a still screen
+        // that starts moving again should not find a number derived from its
+        // stillness waiting for it.
+        if (share >= kKeepingUpShare) {
+            multiplier_ = 1.0;
+        } else if (share >= kMinContentShare) {
+            const double want = std::min(kMaxMultiplier, 1.0 / share);
+            // Down at once, up a step at a time; see the class comment.
+            multiplier_ = want < multiplier_ ? want
+                                             : std::min(want, multiplier_ + kClimbPerInterval);
+        }
+    }
+
+    const auto want_bps = static_cast<uint32_t>(target_bps * multiplier_);
+    // Every command is a call into the MFT mid-stream, so one is only worth
+    // making when it says something new.
+    const double delta = commanded_bps_
+                             ? std::abs(double(want_bps) - commanded_bps_) / commanded_bps_
+                             : 1.0;
+    if (delta >= kCommandHysteresis) commanded_bps_ = want_bps;
+    return commanded_bps_;
 }
 
 } // namespace krg

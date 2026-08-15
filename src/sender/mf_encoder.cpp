@@ -87,7 +87,9 @@ bool MfVideoEncoder::init(ComPtr<ID3D11Device> device, const Config& config) {
     KRG_HR(MFCreateDXGIDeviceManager(&reset_token, &manager_));
     KRG_HR(manager_->ResetDevice(device_.Get(), reset_token));
 
-    if (!init_video_processor(config.width, config.height, config.fps)) return false;
+    if (!init_video_processor(config.width, config.height, config.fps, config.input_format)) {
+        return false;
+    }
 
     // HEVC is worth roughly a third of the bitrate at equal quality, but not
     // every GPU encodes it and not every receiver decodes it, so it stays a
@@ -295,9 +297,10 @@ void MfVideoEncoder::configure_codec(const Config& config) {
     }
 }
 
-bool MfVideoEncoder::init_video_processor(uint32_t width, uint32_t height, uint32_t fps) {
+bool MfVideoEncoder::init_video_processor(uint32_t width, uint32_t height, uint32_t fps,
+                                          DXGI_FORMAT input_format) {
     if (FAILED(device_.As(&video_device_)) || FAILED(context_.As(&video_context_))) {
-        KRG_LOG("device has no video support (BGRA->NV12 conversion unavailable)");
+        KRG_LOG("device has no video support (conversion to NV12 unavailable)");
         return false;
     }
 
@@ -311,10 +314,29 @@ bool MfVideoEncoder::init_video_processor(uint32_t width, uint32_t height, uint3
     desc.OutputHeight = height;
     desc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
     KRG_HR(video_device_->CreateVideoProcessorEnumerator(&desc, &vp_enum_));
+
+    // Asked rather than assumed. Capture hands over BGRA8 — it asks DXGI to
+    // convert an HDR desktop down rather than pass the float surface along —
+    // so anything else here means that conversion did not happen, and this is
+    // where it can be said out loud. Left to itself the failure is per frame
+    // and silent, inside CreateVideoProcessorInputView, and the stream is a
+    // texture nothing ever wrote to. (Not a theoretical fallback: an RTX 4090's
+    // video processor refuses R16G16B16A16_FLOAT as an input format outright.)
+    UINT support = 0;
+    if (FAILED(vp_enum_->CheckVideoProcessorFormat(input_format, &support)) ||
+        !(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
+        KRG_LOG("the video processor will not take DXGI format %d as input, so frames in it "
+                "cannot be converted for the encoder%s", static_cast<int>(input_format),
+                input_format == DXGI_FORMAT_R16G16B16A16_FLOAT
+                    ? " — this is an HDR desktop DXGI declined to convert; turning HDR off for "
+                      "this display will stream it"
+                    : "");
+        return false;
+    }
     KRG_HR(video_device_->CreateVideoProcessor(vp_enum_.Get(), 0, &vp_));
 
-    // BGRA full-range in, BT.709 limited-range NV12 out (what decoders and
-    // the receiver's shader expect).
+    // Full-range RGB in, BT.709 limited-range NV12 out (what decoders and the
+    // receiver's shader expect).
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE in_cs{};
     in_cs.RGB_Range = 0;      // full
     in_cs.YCbCr_Matrix = 1;   // BT.709
@@ -326,7 +348,7 @@ bool MfVideoEncoder::init_video_processor(uint32_t width, uint32_t height, uint3
     return true;
 }
 
-bool MfVideoEncoder::convert_to_nv12(ID3D11Texture2D* bgra, ComPtr<IMFSample>& out) {
+bool MfVideoEncoder::convert_to_nv12(ID3D11Texture2D* source, ComPtr<IMFSample>& out) {
     ComPtr<IMFSample> sample;
     HRESULT hr = allocator_->AllocateSample(&sample);
     if (FAILED(hr)) return false; // pool exhausted: encoder backlogged, drop frame
@@ -343,7 +365,7 @@ bool MfVideoEncoder::convert_to_nv12(ID3D11Texture2D* bgra, ComPtr<IMFSample>& o
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc{};
     in_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
     ComPtr<ID3D11VideoProcessorInputView> in_view;
-    if (FAILED(video_device_->CreateVideoProcessorInputView(bgra, vp_enum_.Get(), &in_desc,
+    if (FAILED(video_device_->CreateVideoProcessorInputView(source, vp_enum_.Get(), &in_desc,
                                                             &in_view))) {
         return false;
     }
@@ -371,9 +393,9 @@ bool MfVideoEncoder::convert_to_nv12(ID3D11Texture2D* bgra, ComPtr<IMFSample>& o
     return true;
 }
 
-bool MfVideoEncoder::encode(ID3D11Texture2D* bgra) {
+bool MfVideoEncoder::encode(ID3D11Texture2D* source) {
     ComPtr<IMFSample> sample;
-    if (!convert_to_nv12(bgra, sample)) {
+    if (!convert_to_nv12(source, sample)) {
         ++dropped_; // encoder backlogged (sample pool exhausted); not fatal
         return true;
     }
