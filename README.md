@@ -16,8 +16,16 @@ Each side is two threads joined by a single-slot, latest-wins **mailbox**
 ([mailbox.h](src/common/mailbox.h)): if a consumer falls behind, stale frames
 are dropped *before* encoding, never after.
 
-- **Capture**: DXGI Desktop Duplication of the primary output, asked for BGRA8
-  explicitly rather than given whatever the desktop happens to be in. With HDR
+- **Capture**: DXGI Desktop Duplication of one display — the primary by
+  default, `--display N|name` for any other, `--list-displays` to see what this
+  machine has. That choice is not only about which screen: duplication works
+  only between an output and the adapter that owns it, so the display picked is
+  also the GPU that capture, the BGRA→NV12 conversion and the encode all run
+  on. Left to itself `D3D11CreateDevice` takes whichever adapter Windows lists
+  first, which on a hybrid machine is as likely to be the iGPU as the card the
+  game is on, and nothing said which one it had been; the startup line now
+  names the monitor and the GPU together. The desktop is asked for BGRA8
+  explicitly rather than given whatever it happens to be in. With HDR
   switched on the desktop composites as scRGB half-float, which nothing
   downstream can use: the copy into the capture pool is a format mismatch,
   which D3D11 answers by doing nothing rather than by failing, so the stream
@@ -202,9 +210,16 @@ Sender flags: `--bitrate N` (Mbit/s, default 40 — a ceiling, not a fixed rate)
 `--min-bitrate N` (how far the link is allowed to push it down, default 3),
 `--no-adapt` to pin the rate at `--bitrate` instead, `--codec h264|hevc|lz4`,
 `--gop N` (frames between keyframes; the default is "only when asked"),
-`--fps N` (default: the display's refresh rate), `--port N`, and `--dummy`,
-which streams a synthetic bouncing square instead of the desktop — useful for
-testing the pipeline without capture, including over loopback.
+`--fps N` (default: the display's refresh rate), `--port N`,
+`--display N|name` (default: the primary; the name is matched case-
+insensitively against any part of `Dell AW3423DW (\\.\DISPLAY1) on NVIDIA
+GeForce RTX 4090`), `--list-displays` to print that list and exit, and
+`--dummy`, which streams a synthetic bouncing square instead of the desktop —
+useful for testing the pipeline without capture, including over loopback.
+
+A `--display` that names no display, or names more than one, stops the sender
+rather than falling back to the primary: capturing a screen other than the one
+asked for is not an improvement on saying so.
 
 Receiver flags: `--stats` for the latency overlay and `--smooth` for the
 waitable-swapchain present mode.
@@ -215,7 +230,10 @@ asking for — on the same content HEVC used a third of H.264's bitrate here.
 
 ## Current limitations / roadmap
 
-- Primary monitor only; no monitor selection.
+- One display at a time, settled at startup: `--display` cannot be changed
+  without restarting the sender, and there is no mode that spans several
+  monitors into a single stream. A display unplugged mid-session is a lost
+  duplication that never comes back, rather than a fall back to another one.
 - A display mode change costs a reconnect rather than being absorbed mid-
   stream, which is a fraction of a second of black. One that lands while no
   client is attached is not noticed until capture resumes, so the first client

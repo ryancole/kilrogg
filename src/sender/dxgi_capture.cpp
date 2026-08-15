@@ -19,9 +19,11 @@ namespace {
 // The duplication's own mode description is the first answer, rounded to whole
 // Hz — 143.998 and 144 are the same decision, and comparing exact rationals
 // would renegotiate the connection every time a driver reported it a hair
-// differently. Not every driver fills it in, hence the second opinion; 60 is
-// the answer that is wrong by the least if neither has one.
-uint32_t refresh_hz_from(const DXGI_MODE_DESC& mode) {
+// differently. Not every driver fills it in, hence the second opinion, which
+// has to name the display being captured: a null device name there is the
+// primary, and with --display that is routinely some other screen running at
+// some other rate.
+uint32_t refresh_hz_from(const DXGI_MODE_DESC& mode, const std::string& device_name) {
     if (mode.RefreshRate.Numerator && mode.RefreshRate.Denominator) {
         const uint32_t d = mode.RefreshRate.Denominator;
         return std::max(1u, (mode.RefreshRate.Numerator + d / 2) / d);
@@ -29,7 +31,9 @@ uint32_t refresh_hz_from(const DXGI_MODE_DESC& mode) {
     DEVMODEA dm{};
     dm.dmSize = sizeof(dm);
     // 0 and 1 both mean "the hardware default" rather than a rate.
-    if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
+    if (EnumDisplaySettingsA(device_name.empty() ? nullptr : device_name.c_str(),
+                             ENUM_CURRENT_SETTINGS, &dm) &&
+        dm.dmDisplayFrequency > 1) {
         return dm.dmDisplayFrequency;
     }
     return 60;
@@ -125,13 +129,18 @@ bool convert_cursor_shape(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& si, const uint8
 }
 } // namespace
 
-std::unique_ptr<DxgiCapture> DxgiCapture::create() {
+std::unique_ptr<DxgiCapture> DxgiCapture::create(const std::string& display_selector) {
+    const std::vector<DisplayDevice> displays = list_displays();
+    const DisplayDevice* chosen = select_display(displays, display_selector);
+    if (!chosen) return nullptr;
     std::unique_ptr<DxgiCapture> cap(new DxgiCapture());
-    if (!cap->init()) return nullptr;
+    if (!cap->init(*chosen)) return nullptr;
     return cap;
 }
 
-bool DxgiCapture::init() {
+bool DxgiCapture::init(const DisplayDevice& display) {
+    display_ = display;
+
     D3D_FEATURE_LEVEL fl{};
     // This device backs the encoder's DXGI device manager and the video
     // processor doing BGRA->NV12, both of which are documented to require
@@ -141,16 +150,22 @@ bool DxgiCapture::init() {
     // refuses them has no video path at all, but --codec lz4 still works, so
     // that is a fallback rather than a failure.
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
-                                   D3D11_SDK_VERSION, &device_, &fl, &context_);
+    // On the adapter that owns the chosen output, because Desktop Duplication
+    // only works between the two — and because the device made here is the one
+    // the encoder and the video processor are handed, so this is the line that
+    // decides which GPU the whole sender runs on. DRIVER_TYPE_UNKNOWN is not a
+    // relaxation: naming an adapter and a driver type at once is an error, and
+    // the adapter already says what it is.
+    HRESULT hr = D3D11CreateDevice(display_.adapter_obj.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                   flags, nullptr, 0, D3D11_SDK_VERSION, &device_, &fl, &context_);
     if (FAILED(hr)) {
-        KRG_LOG("no video-capable D3D11 device (hr=0x%08lX), falling back — only --codec lz4 "
-                "will work", hr);
-        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-                               D3D11_SDK_VERSION, &device_, &fl, &context_);
+        KRG_LOG("no video-capable D3D11 device on %s (hr=0x%08lX), falling back — only "
+                "--codec lz4 will work", display_.adapter.c_str(), hr);
+        hr = D3D11CreateDevice(display_.adapter_obj.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                               nullptr, 0, D3D11_SDK_VERSION, &device_, &fl, &context_);
     }
     if (FAILED(hr)) {
-        KRG_LOG("D3D11CreateDevice failed (hr=0x%08lX)", hr);
+        KRG_LOG("D3D11CreateDevice failed on %s (hr=0x%08lX)", display_.adapter.c_str(), hr);
         return false;
     }
 
@@ -160,28 +175,17 @@ bool DxgiCapture::init() {
     context_.As(&mt);
     if (mt) mt->SetMultithreadProtected(TRUE);
 
-    ComPtr<IDXGIDevice> dxgi_device;
-    device_.As(&dxgi_device);
-    ComPtr<IDXGIAdapter> adapter;
-    dxgi_device->GetAdapter(&adapter);
-
-    ComPtr<IDXGIOutput> output;
-    hr = adapter->EnumOutputs(0, &output);
-    if (FAILED(hr)) {
-        KRG_LOG("no display output found (hr=0x%08lX)", hr);
-        return false;
-    }
-    output.As(&output_);
+    display_.output_obj.As(&output_);
     if (!output_) {
         KRG_LOG("IDXGIOutput1 unavailable — Desktop Duplication needs Windows 8+");
         return false;
     }
-    output.As(&output5_); // optional; see reinit_duplication
+    display_.output_obj.As(&output5_); // optional; see reinit_duplication
 
     if (!reinit_duplication()) return false;
 
-    KRG_LOG("capturing primary output at %ux%u @%uHz, %s", width(), height(), refresh_hz(),
-            format_name(format()));
+    KRG_LOG("capturing %s at %ux%u @%uHz, %s", display_.label().c_str(), width(), height(),
+            refresh_hz(), format_name(format()));
     return true;
 }
 
@@ -222,8 +226,8 @@ bool DxgiCapture::reinit_duplication() {
     // The format here is a seed rather than the last word: the first acquired
     // texture is what the copies actually have to match, and acquire() corrects
     // this from it if the two ever disagree.
-    adopt_mode(desc.ModeDesc.Width, desc.ModeDesc.Height, refresh_hz_from(desc.ModeDesc),
-               desc.ModeDesc.Format);
+    adopt_mode(desc.ModeDesc.Width, desc.ModeDesc.Height,
+               refresh_hz_from(desc.ModeDesc, display_.device), desc.ModeDesc.Format);
 
     first_frame_ = true;
     return true;

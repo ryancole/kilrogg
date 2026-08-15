@@ -3,11 +3,13 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <string>
 
 #include <d3d11.h>
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
+#include "sender/displays.h"
 #include "sender/frame_source.h"
 
 namespace krg {
@@ -26,12 +28,16 @@ struct CursorShape {
     std::vector<uint8_t> invert; // width * height
 };
 
-// Desktop Duplication capture of the primary output. next_frame() returning
-// false is the common case on a static screen (AcquireNextFrame times out
-// rather than erroring) — callers just loop.
+// Desktop Duplication capture of one display. next_frame() returning false is
+// the common case on a static screen (AcquireNextFrame times out rather than
+// erroring) — callers just loop.
 class DxgiCapture final : public FrameSource {
 public:
-    static std::unique_ptr<DxgiCapture> create(); // null on failure
+    // `display_selector` is what --display was given, empty for the primary;
+    // see select_display(). Null on failure, including a selector naming no
+    // display — which is a refusal rather than a fallback, since capturing a
+    // screen other than the one asked for is not an improvement on stopping.
+    static std::unique_ptr<DxgiCapture> create(const std::string& display_selector = {});
 
     bool next_frame(Frame& out) override;
 
@@ -76,7 +82,7 @@ public:
 
 private:
     DxgiCapture() = default;
-    bool init();
+    bool init(const DisplayDevice& display);
     bool reinit_duplication();
     // Adopts a new display mode: publishes the dimensions, refresh rate and
     // pixel format, and throws away the textures cut to the old ones, which are
@@ -93,6 +99,10 @@ private:
     // per acquire attempt, which is the only place the counters move.
     void report_stats();
 
+    // Which display this is capturing, kept for the log lines and because the
+    // refresh rate has to be read from this display rather than from whichever
+    // one Windows considers primary.
+    DisplayDevice display_;
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
