@@ -232,8 +232,8 @@ bool MfVideoEncoder::set_output_type(const Config& config) {
             }
         }
         if (SUCCEEDED(hr)) {
-            KRG_LOG("encoder: %s %s profile, %u Mbit/s target", codec_name(codec_),
-                    profiles[i].name, config.bitrate_bps / 1'000'000);
+            KRG_LOG("encoder: %s %s profile, %u Mbit/s target at %u fps", codec_name(codec_),
+                    profiles[i].name, config.bitrate_bps / 1'000'000, config.fps);
             return true;
         }
         KRG_LOG("encoder: %s profile rejected (hr=0x%08lX)%s", profiles[i].name, hr,

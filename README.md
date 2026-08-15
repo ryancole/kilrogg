@@ -29,6 +29,17 @@ are dropped *before* encoding, never after.
   ~40 Mbit/s default. H.264 High profile where available (its 8×8 transform is
   worth a lot on text) falling back to Main, or HEVC with `--codec hevc`.
   BGRA→NV12 conversion runs on the GPU video processor.
+- **Frame rate**: a CBR encoder divides its bitrate by the frame rate it was
+  configured with to get a budget per frame, so that number has to be the one
+  it is actually fed. Capture polls with a zero timeout and has no rate of its
+  own — a 175 Hz desktop produces frames at 175 Hz — so the sender reads the
+  display's refresh rate, tells the encoder that, and paces its own submissions
+  to match: a frame that arrives early is held rather than sent, and newer
+  frames replace it while it waits, so what goes in at each slot is the latest
+  one. `--fps N` overrides the reading. It is worth overriding when the content
+  cannot keep up with the panel — a 90 fps game on a 175 Hz display delivers
+  barely half the frames the encoder budgeted for, and spends barely half the
+  bitrate.
 - **Keyframes on demand**: the GOP is effectively infinite. A periodic IDR at
   3440×1440 is a bitrate spike big enough to be felt as a hitch on a
   constrained link, so instead one is emitted only when something asks: a fresh
@@ -56,7 +67,11 @@ are dropped *before* encoding, never after.
   connection. Capture adopts the new mode, the sender drops the client, and the
   receiver reconnects into a fresh `Hello` carrying the new size — which it
   adopts by recreating its textures, not its window. Alt-tabbing into a game
-  that sets its own mode used to take the sender down with it.
+  that sets its own mode used to take the sender down with it. A refresh rate
+  change on its own goes the same way: the textures are still the right size,
+  but the encoder is configured for the old rate, and a fraction of a second of
+  black costs less than encoding against the wrong bit budget until the client
+  leaves.
 - **Send queue**: packets go out on their own thread
   ([packet_sender.cpp](src/sender/packet_sender.cpp)) so a slow link never
   blocks the encoder. The queue holds a quarter second of video at the
@@ -117,9 +132,13 @@ scanout   the Present call to the vblank that displayed it (GetFrameStatistics)
 ```
 
 The two machines share no clock, so the receiver runs an NTP-style ping/pong
-over the back-channel and keeps the offset from the shortest round trip seen —
-the sample least distorted by queueing. Until a probe lands, the cross-machine
-figures read `--` rather than a fabricated number. The sender's own 5-second
+over the back-channel and keeps the offset from the shortest round trip seen
+*lately* — the sample least distorted by queueing, from a window half a minute
+wide. The window is the part that matters over a long session: two machines'
+clocks drift apart, which is what the later probes are for, and a best-ever
+sample would mean the first lucky probe won and every one after it was thrown
+away. Until a probe lands, the cross-machine figures read `--` rather than a
+fabricated number. The sender's own 5-second
 log line reports encode latency and the encoder's *pipeline depth*: frames
 handed to the MFT that have not come back out. Zero means low-latency mode is
 genuinely in force and output is 1:1 with input.
@@ -157,9 +176,9 @@ Sender flags: `--bitrate N` (Mbit/s, default 40 — a ceiling, not a fixed rate)
 `--min-bitrate N` (how far the link is allowed to push it down, default 3),
 `--no-adapt` to pin the rate at `--bitrate` instead, `--codec h264|hevc|lz4`,
 `--gop N` (frames between keyframes; the default is "only when asked"),
-`--port N`, and `--dummy`, which streams a synthetic bouncing square instead of
-the desktop — useful for testing the pipeline without capture, including over
-loopback.
+`--fps N` (default: the display's refresh rate), `--port N`, and `--dummy`,
+which streams a synthetic bouncing square instead of the desktop — useful for
+testing the pipeline without capture, including over loopback.
 
 Receiver flags: `--stats` for the latency overlay and `--smooth` for the
 waitable-swapchain present mode.
@@ -175,6 +194,14 @@ asking for — on the same content HEVC used a third of H.264's bitrate here.
   stream, which is a fraction of a second of black. One that lands while no
   client is attached is not noticed until capture resumes, so the first client
   after it is dropped and reconnects a frame or two in.
+- The frame rate the encoder is told is the display's, not the content's, and
+  the two are only the same when something is redrawing the screen every
+  refresh. Sparse content spends proportionally less of the bitrate than was
+  asked for — measured here, a 3440×1440 desktop delivering 72 fps against a
+  175 Hz panel used 22 of a commanded 40 Mbit/s, where the same stream at a
+  matched `--fps` used 40. Rate control cannot recover this: it only ever cuts,
+  and it probes upward to the ceiling the encoder is already dividing. `--fps`
+  set to what the content actually manages is the answer.
 - Rate control reacts rather than predicts: it learns a link is too slow by
   filling the queue on it, so the first second or so of a *new* link going bad
   still costs dropped video and a resync. What it remembers, it remembers only
