@@ -271,6 +271,12 @@ void DxgiCapture::release_duplication() {
     // A mode change that lands while we are not looking goes unnoticed until
     // the duplication comes back; reinit_duplication() picks it up then.
     first_frame_ = true;
+    // Capture is about to park until the next client, and however long that is
+    // it is not part of any window worth averaging over. Zeroing the clock too
+    // is what restarts the window from the first acquire rather than reporting
+    // a handful of frames spread across the wait.
+    stats_ = Stats{};
+    stat_t0_ = {};
 }
 
 void DxgiCapture::update_cursor(const DXGI_OUTDUPL_FRAME_INFO& info) {
@@ -353,9 +359,36 @@ void DxgiCapture::collect_rects(const DXGI_OUTDUPL_FRAME_INFO& info, std::vector
     for (UINT i = 0; i < dirty_bytes / sizeof(RECT); ++i) rects.push_back(rect_from(dirty[i]));
 }
 
+void DxgiCapture::report_stats() {
+    const auto now = std::chrono::steady_clock::now();
+    if (stat_t0_.time_since_epoch().count() == 0) {
+        stat_t0_ = now;
+        return;
+    }
+    if (now - stat_t0_ < std::chrono::seconds(5)) return;
+    const double secs = std::chrono::duration<double>(now - stat_t0_).count();
+    stat_t0_ = now;
+
+    // Frames per second is the number that matters — everything downstream is
+    // paced off it — so it leads, and the rest is why it is what it is. The
+    // recoveries are the loud case: each one costs the 100 ms sleep below, so
+    // even a handful per window caps capture far under the display's rate.
+    KRG_LOG("capture %.1f fps; %.0f/s idle polls, %.1f/s pointer-only", stats_.frames / secs,
+            stats_.timeouts / secs, stats_.cursor_only / secs);
+    const uint64_t recoveries = stats_.access_lost + stats_.invalid_call + stats_.errors;
+    if (recoveries) {
+        KRG_LOG("capture lost the duplication %llu times (%llu access lost, %llu invalid call, "
+                "%llu other), costing at least %.1f s of this %.0f s window",
+                recoveries, stats_.access_lost, stats_.invalid_call, stats_.errors,
+                recoveries * 0.1, secs);
+    }
+    stats_ = Stats{};
+}
+
 bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
                           std::vector<Rect>& rects) {
     have_rects = false;
+    report_stats();
     if (!dup_ && !reinit_duplication()) {
         Sleep(500); // avoid a hot spin while the desktop is unavailable
         return false;
@@ -368,6 +401,7 @@ bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
     // GPU submissions), adding hundreds of ms of latency.
     HRESULT hr = dup_->AcquireNextFrame(0, &info, &resource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        ++stats_.timeouts;
         Sleep(2); // static screen — normal, not an error
         return false;
     }
@@ -376,11 +410,22 @@ bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
         // duplication is poisoned — seen when a game engages exclusive
         // fullscreen, especially on hybrid-GPU machines. Recreate it; the
         // next successful frame is a full-frame keyframe either way.
+        //
+        // Counted separately because they say different things about a stream
+        // that has gone slow: a run of these is capture being knocked over
+        // faster than it can stand back up, and the 100 ms below is then the
+        // frame rate, not the network.
+        if (hr == DXGI_ERROR_ACCESS_LOST) {
+            ++stats_.access_lost;
+        } else {
+            ++stats_.invalid_call;
+        }
         Sleep(100);
         reinit_duplication();
         return false;
     }
     if (FAILED(hr)) {
+        ++stats_.errors;
         KRG_LOG("AcquireNextFrame failed (hr=0x%08lX)", hr);
         Sleep(100);
         return false;
@@ -408,10 +453,12 @@ bool DxgiCapture::acquire(ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
     // Only the mouse pointer changed: no pixels to send. The cursor state
     // recorded above still reaches the client as a cursor packet.
     if (rects.empty()) {
+        ++stats_.cursor_only;
         dup_->ReleaseFrame();
         return false;
     }
 
+    ++stats_.frames;
     have_rects = true;
     return true;
 }
