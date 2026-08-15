@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 
@@ -88,6 +89,9 @@ private:
     // and the caller must ReleaseFrame() after copying from it.
     bool acquire(Microsoft::WRL::ComPtr<ID3D11Texture2D>& acquired, bool& have_rects,
                  std::vector<Rect>& rects);
+    // Emits the 5-second capture line and starts a fresh window. Called once
+    // per acquire attempt, which is the only place the counters move.
+    void report_stats();
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
@@ -110,6 +114,23 @@ private:
     uint32_t frame_id_ = 0;
     bool first_frame_ = true;
     bool lz4_format_warned_ = false; // capture thread only
+
+    // What the acquire loop did over the last five seconds. Everything the
+    // downstream stats lines report starts here, and until this existed a
+    // capture that had stopped producing frames looked exactly like a link
+    // that had stopped carrying them. Capture-thread only, like the loop that
+    // moves them, so no atomics: the counters are read on the same thread that
+    // writes them, in report_stats().
+    struct Stats {
+        uint64_t frames = 0;      // acquires that yielded pixels to send
+        uint64_t timeouts = 0;    // nothing new on screen — the static-screen case
+        uint64_t cursor_only = 0; // a frame arrived, but only the pointer moved
+        uint64_t access_lost = 0; // mode switch, secure desktop, fullscreen handoff
+        uint64_t invalid_call = 0; // duplication poisoned; see acquire()
+        uint64_t errors = 0;      // anything else AcquireNextFrame refused with
+    };
+    Stats stats_;
+    std::chrono::steady_clock::time_point stat_t0_{};
 
     std::mutex cursor_mutex_;
     CursorPos cursor_pos_;
