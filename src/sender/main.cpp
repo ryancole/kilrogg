@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -240,6 +241,15 @@ size_t queue_budget_bytes(uint32_t bps) {
     return std::max<size_t>(512u << 10, size_t{bps} / 32);
 }
 
+// The highest rate the encoder can ever be commanded: the ceiling rate control
+// probes toward, times the largest correction FrameBudget applies on top of it.
+// The encoder has to be built for this — one built for the ceiling alone
+// clamps the correction away and never says so.
+uint32_t headroom_bps(uint32_t ceiling_bps) {
+    const double want = ceiling_bps * FrameBudget::kMaxMultiplier;
+    return static_cast<uint32_t>(std::min(want, static_cast<double>(UINT32_MAX)));
+}
+
 // take_stats() resets its counters, so the control interval has to be the only
 // caller; the 5-second log line is assembled from these instead.
 void accumulate(PacketSender::Stats& acc, const PacketSender::Stats& st) {
@@ -470,6 +480,9 @@ int run_h264(const Options& opt, SOCKET listener) {
         cfg.height = h;
         cfg.fps = display_fps;
         cfg.bitrate_bps = rate.target_bps();
+        // --no-adapt never retargets the encoder, so that one is built for
+        // exactly the rate it was given and nothing above it.
+        cfg.max_bitrate_bps = opt.adapt ? headroom_bps(ceiling_bps) : 0;
         cfg.gop = opt.gop;
         cfg.codec = opt.codec;
         cfg.input_format = format;
@@ -524,7 +537,7 @@ int run_h264(const Options& opt, SOCKET listener) {
         // comes out is the rate the link was asked for. `submitted` is the
         // measurement it runs on, counted where frames actually go in.
         FrameBudget budget(fps);
-        uint32_t commanded_bps = rate.target_bps(); // what the encoder was built with
+        uint32_t commanded_bps = rate.target_bps(); // what the encoder was started at
         uint32_t submitted = 0;
 
         encoder->set_sink([&sender](const uint8_t* data, size_t size, bool keyframe,

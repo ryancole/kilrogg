@@ -26,6 +26,13 @@ public:
         uint32_t width = 0, height = 0;
         uint32_t fps = 60;
         uint32_t bitrate_bps = 0;
+        // The most set_bitrate() will ever ask for. An encoder clamps a
+        // mid-stream rate change to the rate it was built with, silently, so
+        // the transform is built for this and stepped straight back down to
+        // bitrate_bps — leaving every later change inside the clamp. 0 (or
+        // anything below bitrate_bps) builds for the starting rate alone,
+        // which is what a caller that never retargets should ask for.
+        uint32_t max_bitrate_bps = 0;
         // kCodecH264 or kCodecHevc. HEVC falls back to H.264 if this machine
         // has no HEVC encoder; ask codec() for what was actually created.
         uint32_t codec = 1;
@@ -54,7 +61,9 @@ public:
     bool encode(ID3D11Texture2D* source);
     void request_keyframe();
     // Retargets the CBR rate mid-stream; see rate_control.h for who asks and
-    // why. False means the MFT refused, and the caller should stop trying.
+    // why. Never goes above Config::max_bitrate_bps — the MFT was built for
+    // that and would clamp anything past it. False means the MFT refused, and
+    // the caller should stop trying.
     bool set_bitrate(uint32_t bitrate_bps);
 
     uint32_t codec() const { return codec_; }
@@ -73,7 +82,12 @@ private:
     bool init(Microsoft::WRL::ComPtr<ID3D11Device> device, const Config& config);
     // Activates and fully configures an encoder for one codec, so that a
     // failure anywhere in the sequence can be undone and retried with another.
+    // Builds it with the headroom set_bitrate needs, and builds it again
+    // without if this MFT proves it will not come back down.
     bool setup_transform(const Config& config, uint32_t codec);
+    // One build attempt, at one rate: the rate the MFT will treat as its
+    // ceiling for the rest of its life.
+    bool build_transform(const Config& config, uint32_t codec, uint32_t bitrate_bps);
     void release_transform();
     bool select_transform(uint32_t codec);
     // Settles the output type, and with it the frame rate: set_output_type
@@ -81,6 +95,9 @@ private:
     bool set_output_type(const Config& config);
     bool try_output_type(const Config& config, uint32_t fps);
     void configure_codec(const Config& config);
+    // Sets the mean bitrate and checks the MFT agrees it took. Callers hold
+    // mutex_ (or run before the event thread exists).
+    bool apply_bitrate(uint32_t bitrate_bps);
     bool init_video_processor(uint32_t width, uint32_t height, uint32_t fps,
                               DXGI_FORMAT input_format);
     bool convert_to_nv12(ID3D11Texture2D* source, Microsoft::WRL::ComPtr<IMFSample>& out);
@@ -103,9 +120,15 @@ private:
     uint32_t fps_ = 60;
     uint32_t codec_ = 0;
     uint32_t gop_ = 0; // keyframe spacing actually in force; 0 = the MFT's own
+    // The rate the transform was built at, and so the most it will encode at
+    // however high it is retargeted afterwards.
+    uint32_t build_bitrate_ = 0;
+    // False once the MFT has proved it does not take rate changes; set_bitrate
+    // then refuses rather than commanding rates that do nothing. Touched from
+    // init and from the caller's thread in set_bitrate, never the event thread.
+    bool rate_changes_usable_ = true;
 
     std::mutex mutex_; // guards transform_ calls, credits, pending input
-    bool bitrate_readback_checked_ = false; // guarded by mutex_
     int input_credits_ = 0;
     Microsoft::WRL::ComPtr<IMFSample> pending_;
 
