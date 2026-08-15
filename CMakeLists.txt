@@ -41,6 +41,7 @@ target_link_libraries(krg_common PUBLIC ws2_32)
 add_executable(kilrogg-send
   src/sender/main.cpp
   src/sender/control_receiver.cpp
+  src/sender/displays.cpp
   src/sender/dummy_source.cpp
   src/sender/dxgi_capture.cpp
   src/sender/mf_encoder.cpp

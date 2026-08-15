@@ -9,7 +9,12 @@
 #include <oleauto.h>
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
+#include <string>
+#include <map>
+#include <utility>
+#include <vector>
 
 #include "common/clock.h"
 #include "common/log.h"
@@ -64,6 +69,66 @@ uint32_t level_fps_ceiling(uint32_t codec, uint32_t width, uint32_t height) {
     if (codec == kCodecHevc) return 0; // no ceiling worth applying
     const uint64_t mbs = uint64_t((width + 15) / 16) * ((height + 15) / 16);
     return mbs ? static_cast<uint32_t>(kH264MaxMbPerSecond / mbs) : 0;
+}
+
+// MFT_ENUM_ADAPTER_LUID carries a LUID in a UINT64, so the two are converted
+// by copying rather than by any arithmetic on the halves.
+uint64_t packed_luid(const LUID& luid) {
+    uint64_t packed = 0;
+    std::memcpy(&packed, &luid, sizeof(luid));
+    return packed;
+}
+
+// The adapter a D3D11 device was created on, which since capture started
+// pinning that is the GPU the whole sender runs on.
+bool device_luid(ID3D11Device* device, LUID& out) {
+    ComPtr<IDXGIDevice> dxgi_device;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) return false;
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgi_device->GetAdapter(&adapter))) return false;
+    DXGI_ADAPTER_DESC ad{};
+    if (FAILED(adapter->GetDesc(&ad))) return false;
+    out = ad.AdapterLuid;
+    return true;
+}
+
+// Hardware encoders for one codec. With a LUID, only those belonging to that
+// GPU: MFTEnumEx lists every encoder registered on the machine regardless of
+// which card it is on, which on a hybrid laptop means offering NVENC to a
+// process holding an Intel device it cannot bind to. MFTEnum2 can narrow it.
+// A machine whose MFTs do not advertise a LUID answers nothing at all, so an
+// empty result is a reason to ask again unfiltered rather than a verdict.
+HRESULT enum_encoders(uint32_t codec, const LUID* luid, IMFActivate*** activates,
+                      UINT32* count) {
+    *activates = nullptr;
+    *count = 0;
+    MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Video, MFVideoFormat_NV12};
+    MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Video,
+                                    codec == kCodecHevc ? MFVideoFormat_HEVC : MFVideoFormat_H264};
+    const UINT32 flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+    if (luid) {
+        ComPtr<IMFAttributes> attrs;
+        if (SUCCEEDED(MFCreateAttributes(&attrs, 1)) &&
+            SUCCEEDED(attrs->SetUINT64(MFT_ENUM_ADAPTER_LUID, packed_luid(*luid)))) {
+            HRESULT hr = MFTEnum2(MFT_CATEGORY_VIDEO_ENCODER, flags, &in_info, &out_info,
+                                  attrs.Get(), activates, count);
+            if (SUCCEEDED(hr) && *count) return hr;
+            if (*activates) CoTaskMemFree(*activates);
+            *activates = nullptr;
+            *count = 0;
+        }
+        return S_OK; // nothing on that GPU; the caller decides what that means
+    }
+    return MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, &in_info, &out_info, activates, count);
+}
+
+// What an activation failure usually means, since the HRESULT alone has sent
+// this on more than one wild goose chase. E_UNEXPECTED from a vendor MFT is
+// almost never a broken install.
+const char* activation_hint(HRESULT hr) {
+    if (hr != E_UNEXPECTED) return "";
+    return " — usually the GPU's encoder sessions are all held by something else (NVIDIA "
+           "Instant Replay/ShadowPlay, OBS, Discord, a browser), or the card is powered down";
 }
 
 } // namespace
@@ -214,22 +279,17 @@ bool MfVideoEncoder::build_transform(const Config& config, uint32_t codec, uint3
     return true;
 }
 
-bool MfVideoEncoder::select_transform(uint32_t codec) {
-    MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Video, MFVideoFormat_NV12};
-    MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Video,
-                                    codec == kCodecHevc ? MFVideoFormat_HEVC : MFVideoFormat_H264};
+bool MfVideoEncoder::activate_transform(uint32_t codec, const LUID* luid) {
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
-    HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                           MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in_info,
-                           &out_info, &activates, &count);
+    HRESULT hr = enum_encoders(codec, luid, &activates, &count);
     if (FAILED(hr) || count == 0) {
-        KRG_LOG("no hardware %s encoder found on this machine", codec_name(codec));
-        if (SUCCEEDED(hr)) CoTaskMemFree(activates);
+        if (SUCCEEDED(hr) && activates) CoTaskMemFree(activates);
         return false;
     }
-    // Activation can fail even for an enumerated MFT (stale GPU driver is the
-    // usual cause), and multi-GPU machines list several — try each in order.
+    // Activation can fail even for an enumerated MFT (a stale GPU driver, or
+    // another process holding every encoder session the card has), and
+    // multi-GPU machines list several — try each in order.
     for (UINT32 i = 0; i < count && !transform_; ++i) {
         WCHAR name[256] = L"?";
         activates[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
@@ -237,19 +297,119 @@ bool MfVideoEncoder::select_transform(uint32_t codec) {
         if (SUCCEEDED(activate_hr)) {
             KRG_LOG("encoder: %ls (%s)", name, codec_name(codec));
         } else {
-            KRG_LOG("encoder '%ls' failed to activate (hr=0x%08lX), trying next", name,
-                    activate_hr);
+            KRG_LOG("encoder '%ls' failed to activate (hr=0x%08lX)%s", name, activate_hr,
+                    activation_hint(activate_hr));
         }
     }
     for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
     CoTaskMemFree(activates);
-    if (!transform_) {
-        KRG_LOG("no hardware %s encoder could be activated — a GPU driver update usually "
-                "fixes this", codec_name(codec));
-        return false;
+    return transform_ != nullptr;
+}
+
+bool MfVideoEncoder::select_transform(uint32_t codec) {
+    // The encoder has to live on the same GPU as the device it is handed, so
+    // the encoders on that GPU are the only ones that are really candidates.
+    // Asking for them by name rather than taking the machine-wide list is what
+    // stops a hybrid laptop reporting NVENC as a broken encoder when it is
+    // simply the wrong one — and stops the case that actually breaks, where
+    // the wrong MFT activates and then fails SET_D3D_MANAGER, which aborts
+    // creation instead of falling through to the encoder that would have run.
+    LUID luid{};
+    const bool have_luid = device_luid(device_.Get(), luid);
+    if (have_luid && activate_transform(codec, &luid)) {
+        codec_ = codec;
+        return true;
     }
-    codec_ = codec;
-    return true;
+    // Either that GPU advertises no encoder, or none of its encoders would
+    // start. Both are worth a second pass over every encoder the machine has:
+    // the LUID filter is an optimisation of the odds, not a rule about what
+    // can work, and a stream on the wrong GPU beats no stream at all. One
+    // already-refused MFT may be retried here, which costs a duplicate line.
+    if (activate_transform(codec, nullptr)) {
+        codec_ = codec;
+        return true;
+    }
+    KRG_LOG("no hardware %s encoder could be activated%s", codec_name(codec),
+            have_luid ? " on this machine, on the capture GPU or any other" : " on this machine");
+    return false;
+}
+
+void print_encoders() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
+        KRG_LOG("MFStartup failed; no encoder could be enumerated");
+        return;
+    }
+
+    // Every MFT is reported against the GPU it belongs to, because "NVENC will
+    // not start" and "NVENC is on the card with no screen attached" look
+    // identical in a list of names.
+    //
+    // Ownership is worked out by asking each adapter which encoders are its
+    // own — the same filter select_transform runs — rather than by reading the
+    // LUID off each transform, which not every vendor's MFT fills in. That
+    // makes this listing a check on the filter as well as on the encoders: an
+    // encoder shown against a named GPU is one the filter can find, and a row
+    // reading "an unidentified GPU" is one it cannot, which is why the sender
+    // still falls back to the machine-wide list.
+    std::map<std::wstring, std::wstring> owner;
+    ComPtr<IDXGIFactory1> factory;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        for (UINT i = 0;; ++i) {
+            ComPtr<IDXGIAdapter1> a;
+            if (FAILED(factory->EnumAdapters1(i, &a))) break;
+            DXGI_ADAPTER_DESC1 ad{};
+            a->GetDesc1(&ad);
+            for (uint32_t codec : {kCodecH264, kCodecHevc}) {
+                IMFActivate** mine = nullptr;
+                UINT32 n = 0;
+                if (FAILED(enum_encoders(codec, &ad.AdapterLuid, &mine, &n))) continue;
+                for (UINT32 j = 0; j < n; ++j) {
+                    WCHAR name[256] = L"?";
+                    mine[j]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
+                    owner.emplace(name, ad.Description);
+                    mine[j]->Release();
+                }
+                if (mine) CoTaskMemFree(mine);
+            }
+        }
+    }
+
+    for (uint32_t codec : {kCodecH264, kCodecHevc}) {
+        IMFActivate** activates = nullptr;
+        UINT32 count = 0;
+        HRESULT hr = enum_encoders(codec, nullptr, &activates, &count);
+        if (FAILED(hr) || count == 0) {
+            KRG_LOG("%s: no hardware encoder is registered on this machine", codec_name(codec));
+            if (SUCCEEDED(hr) && activates) CoTaskMemFree(activates);
+            continue;
+        }
+        KRG_LOG("%s hardware encoders, in the order the sender would try them:",
+                codec_name(codec));
+        for (UINT32 i = 0; i < count; ++i) {
+            WCHAR name[256] = L"?";
+            activates[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
+            const wchar_t* on = L"an unidentified GPU";
+            if (auto it = owner.find(name); it != owner.end()) on = it->second.c_str();
+            // Actually starting each one is the whole point: this is the same
+            // call that fails at connection time, run without needing a client
+            // to connect, so it can be tried with and without whatever else is
+            // suspected of holding the card's encoder sessions.
+            ComPtr<IMFTransform> transform;
+            HRESULT act = activates[i]->ActivateObject(IID_PPV_ARGS(&transform));
+            if (SUCCEEDED(act)) {
+                KRG_LOG("  %ls on %ls: starts", name, on);
+                transform.Reset();
+                activates[i]->ShutdownObject();
+            } else {
+                KRG_LOG("  %ls on %ls: will not start (hr=0x%08lX)%s", name, on, act,
+                        activation_hint(act));
+            }
+        }
+        for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
+        CoTaskMemFree(activates);
+    }
+    MFShutdown();
 }
 
 bool MfVideoEncoder::set_output_type(const Config& config) {

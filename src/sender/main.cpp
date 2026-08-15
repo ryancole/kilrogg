@@ -20,6 +20,7 @@
 #include "common/net.h"
 #include "common/protocol.h"
 #include "sender/control_receiver.h"
+#include "sender/displays.h"
 #include "sender/dummy_source.h"
 #include "sender/dxgi_capture.h"
 #include "sender/mf_encoder.h"
@@ -39,8 +40,14 @@ struct Options {
     uint32_t min_bitrate_mbps = 3;  // how ugly the picture may get before giving up
     bool adapt = true;
     uint32_t codec = kCodecH264;
+    // Whether --codec was given. The default is a preference and may be
+    // improved on; a codec that was asked for by name is an instruction.
+    bool codec_explicit = false;
     uint32_t gop = 0; // 0 = as long as the encoder allows
     uint32_t fps = 0; // 0 = whatever the display is actually refreshing at
+    std::string display;    // index or name; empty = the primary
+    bool show_displays = false; // --list-displays: print the list and stop
+    bool show_encoders = false; // --list-encoders: probe the encoders and stop
 };
 
 void configure_client_socket(SOCKET s) {
@@ -354,9 +361,21 @@ int run_h264(const Options& opt, SOCKET listener) {
         }
         KRG_LOG("using dummy frame source (1280x720)");
     } else {
-        capture_source = DxgiCapture::create();
+        capture_source = DxgiCapture::create(opt.display);
         if (!capture_source) return 1;
         device = capture_source->device();
+    }
+
+    // Announced here rather than where the listener was opened, so that a
+    // sender which is not going to capture anything — a --display naming a
+    // screen this machine does not have — never claims to be listening first.
+    if (opt.adapt) {
+        KRG_LOG("listening on port %u (%s preferred, %u Mbit/s falling back to %u as the link "
+                "requires)", opt.port, opt.codec == kCodecHevc ? "hevc" : "h264",
+                opt.bitrate_mbps, opt.min_bitrate_mbps);
+    } else {
+        KRG_LOG("listening on port %u (%s preferred, %u Mbit/s fixed)", opt.port,
+                opt.codec == kCodecHevc ? "hevc" : "h264", opt.bitrate_mbps);
     }
 
     // Read per connection rather than once: the desktop can change mode while
@@ -499,6 +518,52 @@ int run_h264(const Options& opt, SOCKET listener) {
             KRG_LOG("could not create a hardware encoder, dropping connection");
             continue;
         }
+
+        // H.264's levels are a macroblock-per-second budget and the encoders
+        // built into GPUs stop at 5.2, so a large display at a high refresh
+        // rate can ask for a level nobody offers. The encoder's whole reply is
+        // a refused media type, and the ladder in set_output_type answers by
+        // walking the frame rate down: 2560x1600 at 240 Hz settles on 129 fps,
+        // which is felt as judder on a 240 Hz panel. HEVC budgets luma samples
+        // instead and has room to spare at any rate a desktop refreshes at.
+        //
+        // Which encoders actually run out is not something to work out from
+        // the spec. NVENC takes 3440x1440 at 175 fps, well past the 107 that
+        // level 5.2 nominally allows, so a ceiling computed up front would
+        // switch codecs on machines that never needed it. What the encoder
+        // settled on is the only honest signal, so the upgrade is a second
+        // attempt rather than a prediction — paid for only on the connections
+        // that were going to judder anyway.
+        if (!opt.codec_explicit && encoder->codec() == kCodecH264 &&
+            encoder->fps() < display_fps && (client_hello.codecs & kCodecHevc)) {
+            const uint32_t h264_fps = encoder->fps();
+            KRG_LOG("H.264 would only take %ux%u at %u fps, short of this display's %u; trying "
+                    "HEVC, whose levels have the headroom", w, h, h264_fps, display_fps);
+            // Released before the second attempt rather than held alongside
+            // it. An encoder occupies one of the card's session slots, and
+            // running out of those is exactly how the sender ends up unable to
+            // build an encoder at all.
+            encoder.reset();
+            MfVideoEncoder::Config hevc_cfg = cfg;
+            hevc_cfg.codec = kCodecHevc;
+            auto hevc = MfVideoEncoder::create(device, hevc_cfg);
+            if (hevc && hevc->fps() > h264_fps) {
+                encoder = std::move(hevc);
+            } else {
+                // Either HEVC would not build here or it bought no frames;
+                // H.264 is the better answer in both cases, being the one
+                // every receiver can decode.
+                hevc.reset();
+                KRG_LOG("HEVC is no better on this machine, staying with H.264 at %u fps",
+                        h264_fps);
+                encoder = MfVideoEncoder::create(device, cfg);
+                if (!encoder) {
+                    KRG_LOG("could not rebuild the H.264 encoder, dropping connection");
+                    continue;
+                }
+            }
+        }
+
         if (!(client_hello.codecs & encoder->codec())) {
             KRG_LOG("receiver decodes none of the codecs this machine can encode, "
                     "dropping connection");
@@ -745,6 +810,7 @@ int run(int argc, char** argv) {
                 KRG_LOG("unknown codec '%s' (h264|hevc|lz4)", argv[i]);
                 return 2;
             }
+            opt.codec_explicit = true;
         } else if (std::strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) {
             opt.bitrate_mbps = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--min-bitrate") == 0 && i + 1 < argc) {
@@ -755,12 +821,31 @@ int run(int argc, char** argv) {
             opt.gop = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
             opt.fps = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--display") == 0 && i + 1 < argc) {
+            opt.display = argv[++i];
+        } else if (std::strcmp(argv[i], "--list-displays") == 0) {
+            opt.show_displays = true;
+        } else if (std::strcmp(argv[i], "--list-encoders") == 0) {
+            opt.show_encoders = true;
         } else {
             KRG_LOG("usage: kilrogg-send [--dummy] [--port N] [--codec h264|hevc|lz4] "
                     "[--bitrate Mbps] [--min-bitrate Mbps] [--no-adapt] [--gop frames] "
-                    "[--fps N]");
+                    "[--fps N] [--display N|name] [--list-displays] [--list-encoders]");
             return 2;
         }
+    }
+    // Before anything asks Windows about a display: the desktop coordinates
+    // DXGI reports back are virtualized for a process that has not said this,
+    // so a scaled monitor would list — and capture — at the size the scaling
+    // pretends it is rather than the size it has.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (opt.show_displays) {
+        print_displays(enumerate_displays());
+        return 0;
+    }
+    if (opt.show_encoders) {
+        print_encoders();
+        return 0;
     }
     // A zero ceiling would leave the controller nothing to work with, and a
     // floor above the ceiling is a typo rather than a request.
@@ -771,7 +856,6 @@ int run(int argc, char** argv) {
     // upper bound is there because this divides the second up.
     if (opt.fps) opt.fps = std::clamp(opt.fps, 1u, 480u);
 
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1); // 1ms timer resolution: capture polling and frame
                         // pacing rely on short sleeps being actually short
     if (!net::init()) {
@@ -788,7 +872,7 @@ int run(int argc, char** argv) {
             source = std::make_unique<DummySource>(1280, 720);
             KRG_LOG("using dummy frame source (1280x720)");
         } else {
-            source = DxgiCapture::create();
+            source = DxgiCapture::create(opt.display);
             if (!source) return 1;
         }
         KRG_LOG("listening on port %u, sharing %ux%u (lz4)", opt.port, source->width(),
@@ -796,14 +880,6 @@ int run(int argc, char** argv) {
         return run_lz4(*source, listener);
     }
 
-    if (opt.adapt) {
-        KRG_LOG("listening on port %u (%s preferred, %u Mbit/s falling back to %u as the link "
-                "requires)", opt.port, opt.codec == kCodecHevc ? "hevc" : "h264",
-                opt.bitrate_mbps, opt.min_bitrate_mbps);
-    } else {
-        KRG_LOG("listening on port %u (%s preferred, %u Mbit/s fixed)", opt.port,
-                opt.codec == kCodecHevc ? "hevc" : "h264", opt.bitrate_mbps);
-    }
     return run_h264(opt, listener);
 }
 
