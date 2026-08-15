@@ -49,6 +49,23 @@ const char* codec_name(uint32_t codec) { return codec == kCodecHevc ? "HEVC" : "
 // thing for a screen-sharing session and stays inside a signed 32-bit range.
 constexpr uint32_t kInfiniteGop = 0x7FFFFFFF;
 
+// A level is a budget of macroblocks per second, and the encoders built into
+// GPUs stop at H.264 level 5.2 — the 6.x levels are in the spec but Intel's
+// encoder does not implement them. So a size and a frame rate together can ask
+// for a level nobody offers: 2560x1600 at 240 Hz wants 3.8M macroblocks a
+// second against level 5.2's 2.07M, and the MFT's entire reply is
+// MF_E_INVALIDMEDIATYPE, on every profile, with nothing in it to say that the
+// frame rate was what it objected to. HEVC budgets luma samples instead and
+// its ceiling is far past anything a desktop refreshes at, so H.264 is the
+// only one that has to be talked down.
+constexpr uint64_t kH264MaxMbPerSecond = 2'073'600; // level 5.2
+
+uint32_t level_fps_ceiling(uint32_t codec, uint32_t width, uint32_t height) {
+    if (codec == kCodecHevc) return 0; // no ceiling worth applying
+    const uint64_t mbs = uint64_t((width + 15) / 16) * ((height + 15) / 16);
+    return mbs ? static_cast<uint32_t>(kH264MaxMbPerSecond / mbs) : 0;
+}
+
 } // namespace
 
 std::unique_ptr<MfVideoEncoder> MfVideoEncoder::create(ComPtr<ID3D11Device> device,
@@ -148,14 +165,18 @@ bool MfVideoEncoder::setup_transform(const Config& config, uint32_t codec) {
     // Keyframe spacing has to be settled before the output type carries it.
     gop_ = config.gop ? config.gop : kInfiniteGop;
     configure_codec(config);
-    // Encoders require the output type before the input type.
+    // Encoders require the output type before the input type. It also settles
+    // the frame rate, which may be lower than the one asked for, and the input
+    // type has to agree with it — the MFT budgets bits per frame from this
+    // number, so a disagreement is spent bitrate.
+    fps_ = config.fps;
     if (!set_output_type(config)) return false;
 
     KRG_HR(MFCreateMediaType(&in_type_));
     KRG_HR(in_type_->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
     KRG_HR(in_type_->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12));
     KRG_HR(MFSetAttributeSize(in_type_.Get(), MF_MT_FRAME_SIZE, config.width, config.height));
-    KRG_HR(MFSetAttributeRatio(in_type_.Get(), MF_MT_FRAME_RATE, config.fps, 1));
+    KRG_HR(MFSetAttributeRatio(in_type_.Get(), MF_MT_FRAME_RATE, fps_, 1));
     KRG_HR(MFSetAttributeRatio(in_type_.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
     KRG_HR(in_type_->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
     KRG_HR(transform_->SetInputType(in_stream_, in_type_.Get(), 0));
@@ -201,6 +222,41 @@ bool MfVideoEncoder::select_transform(uint32_t codec) {
 }
 
 bool MfVideoEncoder::set_output_type(const Config& config) {
+    // Frame rates to offer, best first: what was asked for, then the fastest
+    // the codec's level ceiling leaves at this size, then the two rates that
+    // nothing refuses. Each gets a whole pass over the profiles, because a
+    // rejection says only "no" and the frame rate is the likelier objection —
+    // the profile ladder below cannot get a 240 Hz desktop encoded, and going
+    // straight to Main would give away picture quality to no purpose.
+    uint32_t rates[4];
+    size_t rate_count = 0;
+    auto offer = [&](uint32_t fps) {
+        if (!fps || fps > config.fps) return; // never faster than asked
+        for (size_t i = 0; i < rate_count; ++i) {
+            if (rates[i] == fps) return;
+        }
+        rates[rate_count++] = fps;
+    };
+    offer(config.fps);
+    offer(level_fps_ceiling(codec_, config.width, config.height));
+    offer(60);
+    offer(30);
+
+    for (size_t i = 0; i < rate_count; ++i) {
+        if (try_output_type(config, rates[i])) {
+            fps_ = rates[i]; // what capture will be paced to from here on
+            return true;
+        }
+        if (i + 1 < rate_count) {
+            KRG_LOG("encoder: %ux%u at %u fps is past what this encoder will encode, "
+                    "trying %u fps",
+                    config.width, config.height, rates[i], rates[i + 1]);
+        }
+    }
+    return false;
+}
+
+bool MfVideoEncoder::try_output_type(const Config& config, uint32_t fps) {
     const bool hevc = codec_ == kCodecHevc;
     const Profile* profiles = hevc ? kHevcProfiles : kH264Profiles;
     const size_t profile_count = hevc ? std::size(kHevcProfiles) : std::size(kH264Profiles);
@@ -213,7 +269,7 @@ bool MfVideoEncoder::set_output_type(const Config& config) {
                                  hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264));
         KRG_HR(out_type->SetUINT32(MF_MT_AVG_BITRATE, config.bitrate_bps));
         KRG_HR(MFSetAttributeSize(out_type.Get(), MF_MT_FRAME_SIZE, config.width, config.height));
-        KRG_HR(MFSetAttributeRatio(out_type.Get(), MF_MT_FRAME_RATE, config.fps, 1));
+        KRG_HR(MFSetAttributeRatio(out_type.Get(), MF_MT_FRAME_RATE, fps, 1));
         KRG_HR(MFSetAttributeRatio(out_type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
         KRG_HR(out_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
         KRG_HR(out_type->SetUINT32(MF_MT_MPEG2_PROFILE, profiles[i].value));
@@ -235,7 +291,7 @@ bool MfVideoEncoder::set_output_type(const Config& config) {
         }
         if (SUCCEEDED(hr)) {
             KRG_LOG("encoder: %s %s profile, %u Mbit/s target at %u fps", codec_name(codec_),
-                    profiles[i].name, config.bitrate_bps / 1'000'000, config.fps);
+                    profiles[i].name, config.bitrate_bps / 1'000'000, fps);
             return true;
         }
         KRG_LOG("encoder: %s profile rejected (hr=0x%08lX)%s", profiles[i].name, hr,

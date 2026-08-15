@@ -58,6 +58,10 @@ public:
     bool set_bitrate(uint32_t bitrate_bps);
 
     uint32_t codec() const { return codec_; }
+    // The frame rate the encoder actually accepted, which is the Config's
+    // unless that asked for more than the codec's levels allow at this size.
+    // Feed it at this rate: it budgets bits per frame from this number.
+    uint32_t fps() const { return fps_; }
 
     // Frames handed to the MFT that have not come back out yet, i.e. how deep
     // the encoder's own pipeline is. Zero means output is 1:1 with input and
@@ -72,7 +76,10 @@ private:
     bool setup_transform(const Config& config, uint32_t codec);
     void release_transform();
     bool select_transform(uint32_t codec);
+    // Settles the output type, and with it the frame rate: set_output_type
+    // works down a ladder of rates, each one a full pass over the profiles.
     bool set_output_type(const Config& config);
+    bool try_output_type(const Config& config, uint32_t fps);
     void configure_codec(const Config& config);
     bool init_video_processor(uint32_t width, uint32_t height, uint32_t fps,
                               DXGI_FORMAT input_format);
