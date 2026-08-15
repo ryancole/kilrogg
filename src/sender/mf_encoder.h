@@ -14,6 +14,14 @@
 
 namespace krg {
 
+// Writes what --list-encoders prints: every hardware encoder registered on
+// this machine, the GPU each belongs to, and whether it will actually start
+// right now. The last of those is the point — an encoder that enumerates and
+// then refuses to activate is the failure worth diagnosing, and this runs it
+// without needing a client to connect first, so the same probe can be taken
+// with and without whatever is suspected of holding the card.
+void print_encoders();
+
 // Hardware video encoder (Media Foundation async MFT). encode() takes a BGRA
 // D3D11 texture on the caller's thread, converts it to NV12 on the GPU, and
 // queues it; encoded Annex B packets arrive on an internal event thread via
@@ -90,6 +98,10 @@ private:
     bool build_transform(const Config& config, uint32_t codec, uint32_t bitrate_bps);
     void release_transform();
     bool select_transform(uint32_t codec);
+    // Enumerates and starts the first hardware encoder that will run, either
+    // from one GPU's encoders (`luid`) or from every one the machine has
+    // (null). True with transform_ set.
+    bool activate_transform(uint32_t codec, const LUID* luid);
     // Settles the output type, and with it the frame rate: set_output_type
     // works down a ladder of rates, each one a full pass over the profiles.
     bool set_output_type(const Config& config);

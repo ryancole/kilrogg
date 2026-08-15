@@ -44,6 +44,7 @@ struct Options {
     uint32_t fps = 0; // 0 = whatever the display is actually refreshing at
     std::string display;    // index or name; empty = the primary
     bool show_displays = false; // --list-displays: print the list and stop
+    bool show_encoders = false; // --list-encoders: probe the encoders and stop
 };
 
 void configure_client_socket(SOCKET s) {
@@ -774,10 +775,12 @@ int run(int argc, char** argv) {
             opt.display = argv[++i];
         } else if (std::strcmp(argv[i], "--list-displays") == 0) {
             opt.show_displays = true;
+        } else if (std::strcmp(argv[i], "--list-encoders") == 0) {
+            opt.show_encoders = true;
         } else {
             KRG_LOG("usage: kilrogg-send [--dummy] [--port N] [--codec h264|hevc|lz4] "
                     "[--bitrate Mbps] [--min-bitrate Mbps] [--no-adapt] [--gop frames] "
-                    "[--fps N] [--display N|name] [--list-displays]");
+                    "[--fps N] [--display N|name] [--list-displays] [--list-encoders]");
             return 2;
         }
     }
@@ -788,6 +791,10 @@ int run(int argc, char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (opt.show_displays) {
         print_displays(enumerate_displays());
+        return 0;
+    }
+    if (opt.show_encoders) {
+        print_encoders();
         return 0;
     }
     // A zero ceiling would leave the controller nothing to work with, and a
