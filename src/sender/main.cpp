@@ -657,11 +657,18 @@ int run_h264(const Options& opt, SOCKET listener) {
                 D3D11_TEXTURE2D_DESC td{};
                 (*tex)->GetDesc(&td);
                 if (td.Width != w || td.Height != h || td.Format != format) continue;
-                pacer.on_frame(encoder->pipeline_depth());
+                pacer.on_frame();
                 last_tex = std::move(*tex);
             }
 
-            if (!pacer.take_slot(std::chrono::steady_clock::now(), last_tex != nullptr)) continue;
+            // The depth goes in here rather than above because it is only ever
+            // asked about on a quiet tick, and what matters then is what the
+            // encoder is holding now — not what it was holding when the last
+            // frame turned up, which is when it is busiest.
+            if (!pacer.take_slot(std::chrono::steady_clock::now(), last_tex != nullptr,
+                                 encoder->pipeline_depth())) {
+                continue;
+            }
             if (!encoder->encode(last_tex.Get())) break;
             ++submitted;
         }
