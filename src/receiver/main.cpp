@@ -14,6 +14,7 @@
 
 #include <lz4.h>
 
+#include "common/args.h"
 #include "common/clock.h"
 #include "common/log.h"
 #include "common/mailbox.h"
@@ -476,7 +477,12 @@ int run(int argc, char** argv) {
         } else if (opt.host.empty()) {
             opt.host = argv[i];
         } else {
-            opt.port = static_cast<uint16_t>(std::atoi(argv[i]));
+            uint32_t port = 0;
+            if (!parse_uint(argv[i], 1, 65535, port)) {
+                KRG_LOG("%s: a port number, 1 to 65535", argv[i]);
+                return 2;
+            }
+            opt.port = static_cast<uint16_t>(port);
         }
     }
     if (opt.host.empty()) {

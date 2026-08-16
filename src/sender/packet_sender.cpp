@@ -132,7 +132,7 @@ void PacketSender::run() {
         }
 
         std::lock_guard lock(mutex_);
-        ++stats_.packets;
+        if (packet.video) ++stats_.video_packets;
         stats_.bytes += packet.bytes.size();
     }
 }

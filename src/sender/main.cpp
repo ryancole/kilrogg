@@ -14,6 +14,7 @@
 
 #include <lz4.h>
 
+#include "common/args.h"
 #include "common/gate.h"
 #include "common/log.h"
 #include "common/mailbox.h"
@@ -51,6 +52,14 @@ struct Options {
     bool show_displays = false; // --list-displays: print the list and stop
     bool show_encoders = false; // --list-encoders: probe the encoders and stop
 };
+
+// The most --bitrate may ask for. Rates are carried in bits per second in a
+// uint32, and the encoder is built for three times the ceiling so that the
+// frame-rate correction has somewhere to go (see headroom_bps), so a ceiling
+// past a third of the uint32 range stops being the number that was asked for.
+// A thousand megabits is far beyond any link this gets pointed at and leaves
+// all of that arithmetic exact.
+constexpr uint32_t kMaxBitrateMbps = 1000;
 
 void configure_client_socket(SOCKET s) {
     net::set_low_latency(s);
@@ -228,7 +237,7 @@ constexpr auto kMinKeyframeInterval = std::chrono::milliseconds(500);
 // take_stats() resets its counters, so the control interval has to be the only
 // caller; the 5-second log line is assembled from these instead.
 void accumulate(PacketSender::Stats& acc, const PacketSender::Stats& st) {
-    acc.packets += st.packets;
+    acc.video_packets += st.video_packets;
     acc.bytes += st.bytes;
     acc.dropped_packets += st.dropped_packets;
     acc.dropped_bytes += st.dropped_bytes;
@@ -605,7 +614,8 @@ int run_h264(const Options& opt, SOCKET listener) {
                 stat_t0 = now;
                 const PacketSender::Stats& st = stat_acc;
                 KRG_LOG("wire %.1f fps, %.2f Mbit/s (target %.1f); queue peak %zu KB, now %zu KB",
-                        st.packets / secs, st.bytes * 8.0 / 1e6 / secs, rate.target_bps() / 1e6,
+                        st.video_packets / secs, st.bytes * 8.0 / 1e6 / secs,
+                        rate.target_bps() / 1e6,
                         st.peak_queued_bytes >> 10, st.queued_bytes >> 10);
                 // Only worth a line while it is doing something: a multiplier
                 // of 1 means content is keeping up with the display, which is
@@ -647,11 +657,18 @@ int run_h264(const Options& opt, SOCKET listener) {
                 D3D11_TEXTURE2D_DESC td{};
                 (*tex)->GetDesc(&td);
                 if (td.Width != w || td.Height != h || td.Format != format) continue;
-                pacer.on_frame(encoder->pipeline_depth());
+                pacer.on_frame();
                 last_tex = std::move(*tex);
             }
 
-            if (!pacer.take_slot(std::chrono::steady_clock::now(), last_tex != nullptr)) continue;
+            // The depth goes in here rather than above because it is only ever
+            // asked about on a quiet tick, and what matters then is what the
+            // encoder is holding now — not what it was holding when the last
+            // frame turned up, which is when it is busiest.
+            if (!pacer.take_slot(std::chrono::steady_clock::now(), last_tex != nullptr,
+                                 encoder->pipeline_depth())) {
+                continue;
+            }
             if (!encoder->encode(last_tex.Get())) break;
             ++submitted;
         }
@@ -678,7 +695,12 @@ int run(int argc, char** argv) {
         if (std::strcmp(argv[i], "--dummy") == 0) {
             opt.dummy = true;
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            opt.port = static_cast<uint16_t>(std::atoi(argv[++i]));
+            uint32_t port = 0;
+            if (!parse_uint(argv[++i], 1, 65535, port)) {
+                KRG_LOG("--port %s: a port number, 1 to 65535", argv[i]);
+                return 2;
+            }
+            opt.port = static_cast<uint16_t>(port);
         } else if (std::strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             ++i;
             if (std::strcmp(argv[i], "lz4") == 0) {
@@ -691,9 +713,17 @@ int run(int argc, char** argv) {
             }
             opt.codec_explicit = true;
         } else if (std::strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) {
-            opt.bitrate_mbps = static_cast<uint32_t>(std::atoi(argv[++i]));
+            if (!parse_uint(argv[++i], 1, kMaxBitrateMbps, opt.bitrate_mbps)) {
+                KRG_LOG("--bitrate %s: a whole number of megabits a second, 1 to %u",
+                        argv[i], kMaxBitrateMbps);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--min-bitrate") == 0 && i + 1 < argc) {
-            opt.min_bitrate_mbps = static_cast<uint32_t>(std::atoi(argv[++i]));
+            if (!parse_uint(argv[++i], 1, kMaxBitrateMbps, opt.min_bitrate_mbps)) {
+                KRG_LOG("--min-bitrate %s: a whole number of megabits a second, 1 to %u",
+                        argv[i], kMaxBitrateMbps);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--no-adapt") == 0) {
             opt.adapt = false;
         } else if (std::strcmp(argv[i], "--gop") == 0 && i + 1 < argc) {
@@ -726,10 +756,10 @@ int run(int argc, char** argv) {
         print_encoders();
         return 0;
     }
-    // A zero ceiling would leave the controller nothing to work with, and a
-    // floor above the ceiling is a typo rather than a request.
-    opt.bitrate_mbps = std::max(1u, opt.bitrate_mbps);
-    opt.min_bitrate_mbps = std::clamp(opt.min_bitrate_mbps, 1u, opt.bitrate_mbps);
+    // Both are known to be whole megabits in range by now; what parsing them
+    // separately cannot see is the pair. A floor above the ceiling is a typo
+    // rather than a request, and the ceiling is the half of it to believe.
+    opt.min_bitrate_mbps = std::min(opt.min_bitrate_mbps, opt.bitrate_mbps);
     // 0 keeps the default, which is to ask the display. Anything else is taken
     // as meant, within the range a display could plausibly be running at — the
     // upper bound is there because this divides the second up.

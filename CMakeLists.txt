@@ -91,6 +91,7 @@ if(KRG_BUILD_TESTS)
   enable_testing()
   add_executable(kilrogg-tests
     tests/main.cpp
+    tests/test_args.cpp
     tests/test_clock_sync.cpp
     tests/test_cursor_shape.cpp
     tests/test_displays.cpp

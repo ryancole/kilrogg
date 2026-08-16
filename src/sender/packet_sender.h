@@ -63,7 +63,16 @@ public:
     bool take_resync_request();
 
     struct Stats {
-        uint64_t packets = 0, bytes = 0; // what actually reached the socket
+        // Frames, counted apart from the bytes on purpose. Cursor updates and
+        // pongs go down the same socket and belong in `bytes` — that figure is
+        // the link, and rate control measures it — but they are not frames, so
+        // the sender's reported frame rate must not include them. Measured with
+        // a --stats receiver attached, they run 0.4-0.6 a second at rest and
+        // 2.2 across the window holding the receiver's opening burst of clock
+        // probes; a cursor packet goes out about once per captured frame while
+        // the pointer is actually moving, which is the case that would show.
+        uint64_t video_packets = 0;
+        uint64_t bytes = 0; // everything that reached the socket, frames or not
         uint64_t dropped_packets = 0, dropped_bytes = 0;
         uint64_t backlog_flushes = 0;
         size_t peak_queued_bytes = 0; // high-water mark since the last read
