@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -152,5 +153,23 @@ private:
     double multiplier_ = 1.0;
     uint32_t commanded_bps_ = 0;
 };
+
+// The send queue's backlog budget: a quarter second of video at `bps`, which
+// rides out a Wi-Fi retransmit burst without letting lag build to where it is
+// felt. The floor keeps the queue larger than a single frame at absurdly low
+// bitrates. Retuned whenever the rate moves, since the budget is a wall-clock
+// tolerance expressed in bytes and the two only agree at one rate.
+inline size_t queue_budget_bytes(uint32_t bps) {
+    return std::max<size_t>(512u << 10, size_t{bps} / 32);
+}
+
+// The highest rate the encoder can ever be commanded: the ceiling rate control
+// probes toward, times the largest correction FrameBudget applies on top of it.
+// The encoder has to be built for this — one built for the ceiling alone clamps
+// the correction away and never says so.
+inline uint32_t headroom_bps(uint32_t ceiling_bps) {
+    const double want = ceiling_bps * FrameBudget::kMaxMultiplier;
+    return static_cast<uint32_t>(std::min(want, static_cast<double>(UINT32_MAX)));
+}
 
 } // namespace krg

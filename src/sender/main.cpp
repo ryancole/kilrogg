@@ -26,6 +26,7 @@
 #include "sender/mf_encoder.h"
 #include "sender/packet_sender.h"
 #include "sender/rate_control.h"
+#include "sender/rate_memory.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -85,13 +86,6 @@ bool read_client_hello(SOCKET s, ClientHello& out) {
 // Legacy KRG1 path: dirty rects + LZ4. Lossless; kept as a debug reference
 // (--codec lz4) while the video path matures.
 // ---------------------------------------------------------------------------
-
-Rect clamp_rect(Rect r, uint32_t w, uint32_t h) {
-    if (r.x >= w || r.y >= h) return {0, 0, 0, 0};
-    if (r.x + r.w > w) r.w = w - r.x;
-    if (r.y + r.h > h) r.h = h - r.y;
-    return r;
-}
 
 // Sends one frame as (FrameHeader, rect_count x (RectHeader + LZ4 payload)).
 // Returns bytes written, or -1 on socket/compression failure.
@@ -240,23 +234,6 @@ constexpr auto kMinKeyframeInterval = std::chrono::milliseconds(500);
 // screen; on a moving one the frame pacing expires long before it does.
 constexpr auto kQuietPoll = std::chrono::milliseconds(16);
 
-// The send queue's backlog budget: a quarter second of video at `bps`, which
-// rides out a Wi-Fi retransmit burst without letting lag build to where it is
-// felt. The floor keeps the queue larger than a single frame at absurdly low
-// bitrates.
-size_t queue_budget_bytes(uint32_t bps) {
-    return std::max<size_t>(512u << 10, size_t{bps} / 32);
-}
-
-// The highest rate the encoder can ever be commanded: the ceiling rate control
-// probes toward, times the largest correction FrameBudget applies on top of it.
-// The encoder has to be built for this — one built for the ceiling alone
-// clamps the correction away and never says so.
-uint32_t headroom_bps(uint32_t ceiling_bps) {
-    const double want = ceiling_bps * FrameBudget::kMaxMultiplier;
-    return static_cast<uint32_t>(std::min(want, static_cast<double>(UINT32_MAX)));
-}
-
 // take_stats() resets its counters, so the control interval has to be the only
 // caller; the 5-second log line is assembled from these instead.
 void accumulate(PacketSender::Stats& acc, const PacketSender::Stats& st) {
@@ -268,62 +245,6 @@ void accumulate(PacketSender::Stats& acc, const PacketSender::Stats& st) {
     acc.peak_queued_bytes = std::max(acc.peak_queued_bytes, st.peak_queued_bytes);
     acc.queued_bytes = st.queued_bytes; // a depth, not a delta: latest wins
 }
-
-// What a client's link was last measured to carry. Rate control otherwise
-// starts every connection at the ceiling, which means a receiver that
-// reconnects — and with automatic reconnection, one that reconnects on every
-// hiccup of the very link that is too slow — rediscovers that the only way it
-// can: by overflowing the send queue and spending an IDR on the recovery.
-//
-// The memory is deliberately short. A client back within a minute has the link
-// it just had; ten minutes later it may be somewhere else entirely, and a rate
-// learned on a bad afternoon should not pin the picture down for the evening.
-// In between, the recalled rate relaxes toward the ceiling, so a stale reading
-// costs at most the difference between it and what rate control would have
-// probed its way to anyway.
-class RateMemory {
-public:
-    void remember(const std::string& peer, uint32_t bps) {
-        if (peer.empty()) return;
-        for (Entry& e : entries_) {
-            if (e.peer == peer) {
-                e.bps = bps;
-                e.at = std::chrono::steady_clock::now();
-                return;
-            }
-        }
-        if (entries_.size() >= kMaxEntries) entries_.erase(entries_.begin());
-        entries_.push_back({peer, bps, std::chrono::steady_clock::now()});
-    }
-
-    // 0 when nothing is known, which RateControl reads as "start at the
-    // ceiling" — the right guess for a link nothing has been measured about.
-    uint32_t recall(const std::string& peer, uint32_t ceiling_bps) const {
-        for (const Entry& e : entries_) {
-            if (e.peer != peer) continue;
-            const double age =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - e.at).count();
-            if (age >= kForgetSecs) return 0;
-            const uint32_t bps = std::min(e.bps, ceiling_bps);
-            if (age <= kFreshSecs) return bps;
-            const double t = (age - kFreshSecs) / (kForgetSecs - kFreshSecs);
-            return bps + static_cast<uint32_t>((ceiling_bps - bps) * t);
-        }
-        return 0;
-    }
-
-private:
-    static constexpr double kFreshSecs = 60.0;
-    static constexpr double kForgetSecs = 600.0;
-    static constexpr size_t kMaxEntries = 8;
-
-    struct Entry {
-        std::string peer;
-        uint32_t bps;
-        std::chrono::steady_clock::time_point at;
-    };
-    std::vector<Entry> entries_; // oldest first; evicted from the front
-};
 
 // Cursor packets are produced on the run loop's thread and video packets on
 // the encoder's event thread; the send queue serializes the two, so neither

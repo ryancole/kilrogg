@@ -9,24 +9,11 @@
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
+#include "sender/cursor_shape.h"
 #include "sender/displays.h"
 #include "sender/frame_source.h"
 
 namespace krg {
-
-// Hardware cursor state observed alongside captured frames. Shapes are
-// normalized to straight-alpha BGRA plus an invert mask (255 = XOR-style
-// cursor pixel that inverts whatever is underneath it).
-struct CursorPos {
-    int32_t x = 0, y = 0; // draw origin of the shape's top-left, desktop coords
-    bool visible = false;
-};
-
-struct CursorShape {
-    uint32_t width = 0, height = 0;
-    std::vector<uint8_t> bgra;   // width * height * 4
-    std::vector<uint8_t> invert; // width * height
-};
 
 // Desktop Duplication capture of one display. next_frame() returning false is
 // the common case on a static screen (AcquireNextFrame times out rather than

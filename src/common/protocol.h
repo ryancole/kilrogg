@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace krg {
@@ -100,5 +101,52 @@ constexpr uint32_t kControlKeyframe = 1;
 constexpr uint32_t kControlPing = 2;
 
 constexpr uint32_t kMaxControlPayload = 64;
+
+// Nothing on the wire is authenticated, so every header a peer sends is
+// arithmetic waiting to go wrong on the other side: a rect is turned into a
+// D3D11_BOX and a cursor size into a texture allocation. These are the checks
+// that stand between the two, kept here beside the structs they validate so
+// the rules travel with the format rather than with one reader of it.
+
+// The largest LZ4 payload one rect may claim. A rect covering a 4K screen
+// compresses to a few megabytes at worst, so this is loose enough never to
+// refuse real data and tight enough that a bogus length cannot ask for a
+// gigabyte buffer before anything looks at it.
+constexpr uint32_t kMaxCompressedRect = 64u << 20;
+
+// Windows cursors are at most 256x256 in practice; this leaves room and still
+// bounds the texture a shape update can ask the presenter to create.
+constexpr uint32_t kMaxCursorDimension = 1024;
+
+// A KRG1 rect that can be applied to a `width` x `height` frame.
+//
+// The bounds are written as subtractions rather than as `x + w <= width`
+// because the sum is uint32 arithmetic and wraps: x = 0xFFFFF000 with w = 0x1000
+// sums to 0, which passes any comparison against a width. Subtracting from the
+// bound cannot wrap, since x has already been shown not to exceed it.
+inline bool valid_rect_header(const RectHeader& rh, uint32_t width, uint32_t height) {
+    if (rh.w == 0 || rh.h == 0) return false;
+    if (rh.x > width || rh.w > width - rh.x) return false;
+    if (rh.y > height || rh.h > height - rh.y) return false;
+    // Widened for the same reason. A rect whose true size does not fit in the
+    // uint32 the sender declared it in can never match, which is the answer.
+    if (rh.raw_size != uint64_t{rh.w} * rh.h * 4) return false;
+    return rh.comp_size > 0 && rh.comp_size <= kMaxCompressedRect;
+}
+
+// A cursor packet whose declared shape matches the bytes that arrived with it:
+// `payload_size` counts the CursorUpdate itself plus everything after it.
+// Without a shape the dimensions describe nothing and are not read, so they are
+// not judged either — only the length has to agree.
+inline bool valid_cursor_payload(const CursorUpdate& cu, size_t payload_size) {
+    if (cu.has_shape) {
+        if (cu.width == 0 || cu.height == 0) return false;
+        if (cu.width > kMaxCursorDimension || cu.height > kMaxCursorDimension) return false;
+    }
+    const uint64_t pixels = uint64_t{cu.width} * cu.height;
+    // BGRA plus the one-byte invert mask: five bytes a pixel.
+    const uint64_t expected = sizeof(CursorUpdate) + (cu.has_shape ? pixels * 5 : 0);
+    return payload_size == expected;
+}
 
 } // namespace krg
