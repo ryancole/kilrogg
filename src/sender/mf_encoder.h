@@ -124,6 +124,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> vp_enum_;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> vp_;
     Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> manager_;
+    // The activation object transform_ came out of, kept for as long as the
+    // transform is, so the MFT can be shut down the documented way rather than
+    // merely dropped. What that is worth is measured in release_transform().
+    Microsoft::WRL::ComPtr<IMFActivate> activate_;
     Microsoft::WRL::ComPtr<IMFTransform> transform_;
     Microsoft::WRL::ComPtr<IMFMediaEventGenerator> events_;
     Microsoft::WRL::ComPtr<IMFMediaType> in_type_; // kept for the sample allocator

@@ -150,6 +150,11 @@ MfVideoEncoder::~MfVideoEncoder() {
         transform_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     }
     if (event_thread_.joinable()) event_thread_.join();
+    // Only now: release_transform() drops the pointers the event thread was
+    // calling through, and the drain above is what gets it here to be joined.
+    // The pending frame goes first because it is a sample the MFT was given.
+    pending_.Reset();
+    release_transform();
 }
 
 bool MfVideoEncoder::init(ComPtr<ID3D11Device> device, const Config& config) {
@@ -200,10 +205,28 @@ bool MfVideoEncoder::init(ComPtr<ID3D11Device> device, const Config& config) {
     return true;
 }
 
+// ShutdownObject is the documented teardown for an object built from an
+// IMFActivate, and it is what --list-encoders already does with the transforms
+// it starts. Releasing the transform alone is enough on the encoders measured
+// here — ten connect/disconnect cycles against NVENC hold a sender flat at 540
+// handles and 33 threads either way, so this fixes no leak that this machine
+// has. It is here because the resource at stake is the one thing in this file
+// with no margin: a card has a handful of encoder sessions, an MFT that stayed
+// alive would hold one per connection, and the symptom would be a sender that
+// works for a while and then cannot build an encoder at all — diagnosed, going
+// by activation_hint, as some other process holding the card. A vendor MFT that
+// needs the documented call to let go is not something to discover that way.
+//
+// Our own references go first so that ShutdownObject is what drops the last
+// one, which is the order the MF samples use.
 void MfVideoEncoder::release_transform() {
     events_.Reset();
     transform_.Reset();
     in_type_.Reset();
+    if (activate_) {
+        activate_->ShutdownObject();
+        activate_.Reset();
+    }
     codec_ = 0;
 }
 
@@ -295,6 +318,10 @@ bool MfVideoEncoder::activate_transform(uint32_t codec, const LUID* luid) {
         activates[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256, nullptr);
         HRESULT activate_hr = activates[i]->ActivateObject(IID_PPV_ARGS(&transform_));
         if (SUCCEEDED(activate_hr)) {
+            // Kept because releasing the transform is not what frees it; see
+            // release_transform. The enumeration's own reference is dropped
+            // below, so this one has to be taken here.
+            activate_ = activates[i];
             KRG_LOG("encoder: %ls (%s)", name, codec_name(codec));
         } else {
             KRG_LOG("encoder '%ls' failed to activate (hr=0x%08lX)%s", name, activate_hr,
