@@ -228,7 +228,7 @@ constexpr auto kMinKeyframeInterval = std::chrono::milliseconds(500);
 // take_stats() resets its counters, so the control interval has to be the only
 // caller; the 5-second log line is assembled from these instead.
 void accumulate(PacketSender::Stats& acc, const PacketSender::Stats& st) {
-    acc.packets += st.packets;
+    acc.video_packets += st.video_packets;
     acc.bytes += st.bytes;
     acc.dropped_packets += st.dropped_packets;
     acc.dropped_bytes += st.dropped_bytes;
@@ -605,7 +605,8 @@ int run_h264(const Options& opt, SOCKET listener) {
                 stat_t0 = now;
                 const PacketSender::Stats& st = stat_acc;
                 KRG_LOG("wire %.1f fps, %.2f Mbit/s (target %.1f); queue peak %zu KB, now %zu KB",
-                        st.packets / secs, st.bytes * 8.0 / 1e6 / secs, rate.target_bps() / 1e6,
+                        st.video_packets / secs, st.bytes * 8.0 / 1e6 / secs,
+                        rate.target_bps() / 1e6,
                         st.peak_queued_bytes >> 10, st.queued_bytes >> 10);
                 // Only worth a line while it is doing something: a multiplier
                 // of 1 means content is keeping up with the display, which is
