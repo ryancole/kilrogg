@@ -23,6 +23,7 @@
 #include "sender/displays.h"
 #include "sender/dummy_source.h"
 #include "sender/dxgi_capture.h"
+#include "sender/frame_pacer.h"
 #include "sender/mf_encoder.h"
 #include "sender/packet_sender.h"
 #include "sender/rate_control.h"
@@ -212,11 +213,6 @@ int run_lz4(FrameSource& source, SOCKET listener) {
 // KRG2 path: hardware H.264. Frames stay on the GPU from capture to encoder.
 // ---------------------------------------------------------------------------
 
-// Ceiling on the quiet-tick re-submits described in the run loop. The depth it
-// clamps is a property of the encoder, not the content, so anything this large
-// means the reading is wrong and duplicate frames should stop rather than run.
-constexpr int kMaxFlushResubmits = 8;
-
 // How often the rate controller looks at the send queue. Short enough that a
 // link going bad is answered within a few frames, long enough that the sample
 // is not one frame's worth of noise.
@@ -228,11 +224,6 @@ constexpr auto kControlInterval = std::chrono::milliseconds(200);
 // this window are held rather than discarded — a receiver that cannot decode
 // still gets its keyframe, just not instantly.
 constexpr auto kMinKeyframeInterval = std::chrono::milliseconds(500);
-
-// The longest the run loop will sit waiting for a frame that may never come.
-// It bounds how late the control and stats intervals above can run on a static
-// screen; on a moving one the frame pacing expires long before it does.
-constexpr auto kQuietPoll = std::chrono::milliseconds(16);
 
 // take_stats() resets its counters, so the control interval has to be the only
 // caller; the 5-second log line is assembled from these instead.
@@ -496,7 +487,6 @@ int run_h264(const Options& opt, SOCKET listener) {
         // display's — commanding a 240 Hz budget into an encoder configured for
         // 129 would overspend the link by the ratio between them.
         const uint32_t fps = encoder->fps();
-        const auto frame_interval = std::chrono::microseconds(1'000'000 / fps);
 
         Hello hello{kMagicVideo, w, h, encoder->codec()};
         if (!net::send_all(client, &hello, sizeof(hello))) continue;
@@ -534,17 +524,10 @@ int run_h264(const Options& opt, SOCKET listener) {
         auto last_keyframe = std::chrono::steady_clock::now();
         bool keyframe_pending = false;
 
-        // Async encoders can hold a pipeline of frames, emitting frame N only
-        // once frame N+1 arrives; sparse content (a desktop with occasional
-        // changes) would then sit in the encoder indefinitely. On a quiet tick,
-        // re-submit the last frame to push the stuck ones out — but only as
-        // many times as the encoder is actually holding, so a static screen
-        // stops producing traffic and an encoder that honours low-latency mode
-        // (depth 0) never pays for this at all.
+        // When frames go in, and how long to wait for one; see frame_pacer.h.
+        // The frame itself stays here — the pacer only keeps the time.
+        FramePacer pacer(fps, std::chrono::steady_clock::now());
         ComPtr<ID3D11Texture2D> last_tex;
-        bool tex_unsent = false;
-        int flush_budget = 0;
-        auto next_submit = std::chrono::steady_clock::now();
         // Version 0 = "never sent to this client": the first poll always
         // delivers the current shape and position to a fresh connection.
         uint64_t cursor_pos_ver = 0, cursor_shape_ver = 0;
@@ -653,17 +636,7 @@ int run_h264(const Options& opt, SOCKET listener) {
                     queue_cursor(sender, cursor_pos, shape_changed ? &shape : nullptr);
                 }
             }
-            // Holding a frame that arrived early is what paces the encoder to
-            // the rate it was configured for: newer frames replace it in the
-            // mailbox while it waits, so what goes in at the slot is the
-            // latest one either way. With nothing in hand there is no slot to
-            // wait for, only the poll — which also keeps a static screen from
-            // spinning here once the flush budget is spent.
-            std::chrono::steady_clock::duration wait = kQuietPoll;
-            if (tex_unsent && next_submit > now) {
-                wait = std::min<std::chrono::steady_clock::duration>(kQuietPoll, next_submit - now);
-            }
-            auto tex = mailbox.pop_for(wait);
+            auto tex = mailbox.pop_for(pacer.wait_for(now));
             if (tex) {
                 // Capture may have adopted a new display mode between the
                 // handshake and now; the flag that ends this connection is
@@ -674,26 +647,11 @@ int run_h264(const Options& opt, SOCKET listener) {
                 D3D11_TEXTURE2D_DESC td{};
                 (*tex)->GetDesc(&td);
                 if (td.Width != w || td.Height != h || td.Format != format) continue;
-                // Sampled before submitting: this is how many earlier frames
-                // the MFT is still sitting on, and therefore how many pushes
-                // it takes to get the frame we are about to hand it back out.
-                flush_budget = std::min(encoder->pipeline_depth(), kMaxFlushResubmits);
+                pacer.on_frame(encoder->pipeline_depth());
                 last_tex = std::move(*tex);
-                tex_unsent = true;
             }
 
-            const auto at = std::chrono::steady_clock::now();
-            if (at < next_submit) continue; // this frame's slot has not come round
-            if (!tex_unsent) {
-                if (flush_budget <= 0 || !last_tex) continue;
-                --flush_budget;
-            }
-            tex_unsent = false;
-            next_submit += frame_interval;
-            // Falling a whole frame behind — a stalled encoder, a capture that
-            // went away for a moment — is not a reason to then send a burst
-            // catching up on frames nobody will ever see.
-            if (next_submit < at) next_submit = at + frame_interval;
+            if (!pacer.take_slot(std::chrono::steady_clock::now(), last_tex != nullptr)) continue;
             if (!encoder->encode(last_tex.Get())) break;
             ++submitted;
         }

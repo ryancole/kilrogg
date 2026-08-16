@@ -95,6 +95,7 @@ if(KRG_BUILD_TESTS)
     tests/test_cursor_shape.cpp
     tests/test_displays.cpp
     tests/test_frame_budget.cpp
+    tests/test_frame_pacer.cpp
     tests/test_mailbox.cpp
     tests/test_protocol.cpp
     tests/test_rate_control.cpp
