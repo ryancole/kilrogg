@@ -187,6 +187,23 @@ cmake -B build
 cmake --build build --config Release
 ```
 
+## Tests
+
+```
+ctest --test-dir build -C Release
+```
+
+The suite covers the parts of the pipeline that are decisions rather than
+device calls: the AIMD rate controller and the frame-rate budget that sits on
+top of it, the per-client rate memory and its expiry, the clock-offset
+estimate, the latest-wins mailbox and the capture gate, cursor shape decoding,
+`--display` resolution, and the validation every header off the wire has to
+pass. None of it needs a GPU, a socket or a screen — which is the point, since
+everything else here can only be exercised by pointing it at a real desktop.
+
+doctest is fetched at configure time and pinned, like LZ4;
+`-DKRG_BUILD_TESTS=OFF` skips the fetch and builds only the two executables.
+
 ## Run
 
 On the machine being shared:

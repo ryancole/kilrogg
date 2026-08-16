@@ -41,6 +41,7 @@ target_link_libraries(krg_common PUBLIC ws2_32)
 add_executable(kilrogg-send
   src/sender/main.cpp
   src/sender/control_receiver.cpp
+  src/sender/cursor_shape.cpp
   src/sender/displays.cpp
   src/sender/dummy_source.cpp
   src/sender/dxgi_capture.cpp
@@ -62,3 +63,52 @@ add_executable(kilrogg-recv
 target_include_directories(kilrogg-recv PRIVATE ${lz4_SOURCE_DIR}/lib)
 target_link_libraries(kilrogg-recv PRIVATE krg_common ${KRG_LZ4} d3d11 dxgi d3dcompiler user32
   gdi32 mf mfplat mfuuid evr ole32 oleaut32)
+
+# Tests cover the parts of the pipeline that are decisions rather than device
+# calls: rate control, the frame-rate budget, the clock-offset estimate, wire
+# validation, cursor shape decoding, display selection. None of them need a GPU,
+# a socket or a screen, which is why they are worth having — everything else in
+# this project can only be tested by pointing it at a real desktop.
+# -DKRG_BUILD_TESTS=OFF skips the doctest fetch entirely.
+option(KRG_BUILD_TESTS "Build the kilrogg test suite" ON)
+if(KRG_BUILD_TESTS)
+  # SOURCE_SUBDIR names a directory with no CMakeLists.txt in it, which is how
+  # FetchContent is told to fetch this and configure nothing. doctest is a
+  # single header; its own build system declares a cmake_minimum_required that
+  # CMake 4 refuses outright, and none of what it builds is wanted here anyway.
+  FetchContent_Declare(
+    doctest
+    GIT_REPOSITORY https://github.com/doctest/doctest.git
+    GIT_TAG        v2.4.11
+    SOURCE_SUBDIR  doctest
+  )
+  FetchContent_MakeAvailable(doctest)
+  add_library(krg_doctest INTERFACE)
+  # SYSTEM so /W4 applies to the tests and not to doctest's header, which trips
+  # a conformance warning of its own on current MSVC.
+  target_include_directories(krg_doctest SYSTEM INTERFACE ${doctest_SOURCE_DIR})
+
+  enable_testing()
+  add_executable(kilrogg-tests
+    tests/main.cpp
+    tests/test_clock_sync.cpp
+    tests/test_cursor_shape.cpp
+    tests/test_displays.cpp
+    tests/test_frame_budget.cpp
+    tests/test_mailbox.cpp
+    tests/test_protocol.cpp
+    tests/test_rate_control.cpp
+    tests/test_rate_memory.cpp
+    # Under test, not merely linked: these are the only two translation units
+    # with logic in them that is not already header-only.
+    src/sender/cursor_shape.cpp
+    src/sender/displays.cpp
+    src/sender/rate_control.cpp
+  )
+  target_link_libraries(kilrogg-tests PRIVATE krg_common krg_doctest dxgi user32)
+
+  include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
+  # One CTest case per TEST_CASE rather than one for the whole binary, so a
+  # failure names itself in the ctest output instead of just the executable.
+  doctest_discover_tests(kilrogg-tests)
+endif()
