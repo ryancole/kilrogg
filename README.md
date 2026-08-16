@@ -197,8 +197,8 @@ The suite covers the parts of the pipeline that are decisions rather than
 device calls: the AIMD rate controller and the frame-rate budget that sits on
 top of it, the per-client rate memory and its expiry, the clock-offset
 estimate, the latest-wins mailbox and the capture gate, cursor shape decoding,
-`--display` resolution, and the validation every header off the wire has to
-pass. None of it needs a GPU, a socket or a screen — which is the point, since
+`--display` resolution, the numbers taken off the command line, and the
+validation every header off the wire has to pass. None of it needs a GPU, a socket or a screen — which is the point, since
 everything else here can only be exercised by pointing it at a real desktop.
 
 doctest is fetched at configure time and pinned, like LZ4;
@@ -240,10 +240,16 @@ useful for testing the pipeline without capture, including over loopback.
 
 A `--display` that names no display, or names more than one, stops the sender
 rather than falling back to the primary: capturing a screen other than the one
-asked for is not an improvement on saying so.
+asked for is not an improvement on saying so. The numeric flags stop it for the
+same reason: `--bitrate` and `--min-bitrate` take a whole number of megabits
+from 1 to 1000, `--port` a port from 1 to 65535, and anything else — a typo, a
+negative, a number past what the arithmetic carries — is refused rather than
+folded into the nearest legal value. Folding is how `--bitrate 5000` used to
+leave the sender announcing one rate and encoding at another.
 
 Receiver flags: `--stats` for the latency overlay and `--smooth` for the
-waitable-swapchain present mode.
+waitable-swapchain present mode. The optional port after the host is checked
+the same way as the sender's `--port`, and refused the same way.
 
 `--codec hevc` is a request, not a demand: the receiver advertises what it can
 decode and the sender falls back to H.264 if either end lacks HEVC. It is worth
