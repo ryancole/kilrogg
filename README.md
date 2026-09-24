@@ -1,8 +1,8 @@
 # kilrogg
 
-Low-latency one-way Windows screen streaming over LAN, built for game
-streaming (the whole screen changing every frame). No audio, no input — just
-pixels, as fast as possible.
+Low-latency one-way Windows screen streaming over LAN, built to hold up even
+when the whole screen changes every frame. No audio, no input — just pixels, as
+fast as possible.
 
 ## Pipeline
 
@@ -22,8 +22,8 @@ are dropped *before* encoding, never after.
   only between an output and the adapter that owns it, so the display picked is
   also the GPU that capture, the BGRA→NV12 conversion and the encode all run
   on. Left to itself `D3D11CreateDevice` takes whichever adapter Windows lists
-  first, which on a hybrid machine is as likely to be the iGPU as the card the
-  game is on, and nothing said which one it had been; the startup line now
+  first, which on a hybrid machine is as likely to be the iGPU as the card driving
+  the display, and nothing said which one it had been; the startup line now
   names the monitor and the GPU together. The desktop is asked for BGRA8
   explicitly rather than given whatever it happens to be in. With HDR
   switched on the desktop composites as scRGB half-float, which nothing
